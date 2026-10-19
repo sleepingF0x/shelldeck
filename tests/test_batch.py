@@ -11,8 +11,8 @@ import subprocess
 import tempfile
 import unittest
 
-from nc_multi import BATCH_DECODER, BatchResult, SEND_LIMIT
-from test_nc_multi import RunningConsole
+from shelldeck import BATCH_DECODER, BatchResult, SEND_LIMIT
+from test_shelldeck import RunningConsole
 
 
 BASH = shutil.which("bash")
@@ -29,14 +29,14 @@ class BatchDecoderTests(unittest.TestCase):
         executable = self.directory / "bash"
         executable.write_text(
             f"#!{BASH}\n"
-            '[[ $# == 3 && $1 == -c && $3 == nc-multi-batch ]] || exit 81\n'
+            '[[ $# == 3 && $1 == -c && $3 == shelldeck-batch ]] || exit 81\n'
             'printf "%s" "$2" > "$CAPTURE_PATH"\nexit 7\n'
         )
         executable.chmod(0o700)
 
     def decode(self, encoded):
         return subprocess.run(
-            [BASH, "-c", BATCH_DECODER, "nc-multi-decode", encoded],
+            [BASH, "-c", BATCH_DECODER, "shelldeck-decode", encoded],
             env={**os.environ, "PATH": str(self.directory), "CAPTURE_PATH": str(self.capture)},
             capture_output=True, timeout=5,
         )
@@ -60,7 +60,7 @@ class BatchDecoderTests(unittest.TestCase):
 
 class BatchFrameTests(unittest.TestCase):
     def test_every_frame_boundary_preserves_output_and_exit_status(self):
-        prefix = b"\x1eNCMB_test:"
+        prefix = b"\x1eSHELLDECK_BATCH_test:"
         data = b"before" + prefix + b"start\x1fresult" + prefix + b"end:7\x1fafter"
         for split in range(len(data) + 1):
             with self.subTest(split=split):
@@ -72,7 +72,7 @@ class BatchFrameTests(unittest.TestCase):
                 self.assertEqual(result.exit_code, 7)
 
     def test_malformed_frames_are_output_and_pending_memory_is_bounded(self):
-        prefix = b"\x1eNCMB_test:"
+        prefix = b"\x1eSHELLDECK_BATCH_test:"
         result = BatchResult(1, 1, "127.0.0.1:1", prefix)
         bad = prefix + b"end:0\x1f" + prefix + b"invalid" * 10000
         output = b"".join(result.feed(bad[i:i + 37]) for i in range(0, len(bad), 37))
@@ -128,13 +128,13 @@ class BatchIntegrationTests(unittest.TestCase):
         self.console.read_until(b"Session 1: failed, exit 7.")
         self.console.read_until(b"Session 2: ok, exit 0.")
         self.console.command("jobs 1")
-        output = self.console.read_until(b"nc-multi> ")
+        output = self.console.read_until(b"shelldeck> ")
         self.assertRegex(output, rb"1\s+127\.0\.0\.1:\d+\s+failed\s+7")
         self.assertRegex(output, rb"2\s+127\.0\.0\.1:\d+\s+ok\s+0")
         self.console.command("i 1")
         output = self.console.read_until(b"hello-first")
         self.assertNotIn(b"hello-second", output)
-        self.assertNotIn(b"\x1eNCMB_", output)
+        self.assertNotIn(b"\x1eSHELLDECK_BATCH_", output)
         self.console.type(b"printf 'PARENT-STILL-ALIVE\\n'\r")
         self.console.read_until(b"PARENT-STILL-ALIVE")
 
@@ -147,7 +147,7 @@ class BatchIntegrationTests(unittest.TestCase):
         self.console.read_until(b"Session 2: ok, exit 0.")
         self.assertFalse(select.select([excluded], [], [], 0.1)[0], "script reached an unselected session")
         self.console.command("jobs 1")
-        listing = self.console.read_until(b"nc-multi> ")
+        listing = self.console.read_until(b"shelldeck> ")
         self.assertRegex(listing, rb"\n2\s+127\.0\.0\.1:\d+\s+ok\s+0")
         self.assertNotRegex(listing, rb"\n1\s+127\.0\.0\.1:")
 
@@ -168,7 +168,7 @@ class BatchIntegrationTests(unittest.TestCase):
         for arguments in invalid_arguments:
             with self.subTest(arguments=arguments):
                 self.console.command("batch " + shlex.quote(str(path)) + " " + arguments)
-                output = self.console.read_until(b"nc-multi> ")
+                output = self.console.read_until(b"shelldeck> ")
                 self.assertIn(b"Batch not started:", output)
                 self.assertFalse(select.select([connected], [], [], 0.05)[0], "an invalid selection sent a script")
         self.console.command("jobs")
@@ -195,7 +195,7 @@ class BatchIntegrationTests(unittest.TestCase):
         self.console.read_until(b"Session 3: ok, exit 0.")
         self.assertFalse(select.select([busy, excluded], [], [], 0.1)[0])
         self.console.command("jobs 2")
-        listing = self.console.read_until(b"nc-multi> ")
+        listing = self.console.read_until(b"shelldeck> ")
         self.assertRegex(listing, rb"\n1\s+127\.0\.0\.1:\d+\s+skipped-busy\s+-")
         self.assertRegex(listing, rb"\n3\s+127\.0\.0\.1:\d+\s+ok\s+0")
         self.assertNotRegex(listing, rb"\n2\s+127\.0\.0\.1:")
@@ -268,13 +268,13 @@ class BatchIntegrationTests(unittest.TestCase):
         self.console.read_until(b"Session 3 connected")
         self.assertFalse(select.select([late], [], [], 0.1)[0])
         self.console.command("jobs")
-        output = self.console.read_until(b"nc-multi> ")
+        output = self.console.read_until(b"shelldeck> ")
         self.assertRegex(output, rb"1\s+127\.0\.0\.1:\d+\s+sent\s+-")
         self.assertNotRegex(output, rb"\n3\s+127")
         slow.close()
         self.console.read_until(b"Session 1 disconnected")
         self.console.command("jobs 1")
-        output = self.console.read_until(b"nc-multi> ")
+        output = self.console.read_until(b"shelldeck> ")
         self.assertRegex(output, rb"1\s+127\.0\.0\.1:\d+\s+disconnected\s+-")
 
     def test_running_job_rejects_manual_input_and_duplicate_dispatch(self):
@@ -305,13 +305,13 @@ class BatchIntegrationTests(unittest.TestCase):
                 data = client.recv(65536)
                 self.assertTrue(data, "connection closed before the batch was sent")
                 packet.extend(data)
-            tokens.append(re.search(rb"NCMB_[0-9a-f]{32}", packet)[0])
+            tokens.append(re.search(rb"SHELLDECK_BATCH_[0-9a-f]{32}", packet)[0])
         clients[0].sendall(b"\x1e" + tokens[0] + b":start\x1fRUNNING-OUTPUT")
         self.console.command("i 1")
         self.console.read_until(b"RUNNING-OUTPUT")
         self.console.detach()
         self.console.command("jobs 1")
-        output = self.console.read_until(b"nc-multi> ")
+        output = self.console.read_until(b"shelldeck> ")
         self.assertRegex(output, rb"1\s+127\.0\.0\.1:\d+\s+running\s+-")
         self.assertRegex(output, rb"2\s+127\.0\.0\.1:\d+\s+sent\s+-")
         self.console.command("close all")
@@ -319,7 +319,7 @@ class BatchIntegrationTests(unittest.TestCase):
         for client in clients:
             self.assertEqual(client.recv(1), b"")
         self.console.command("jobs 1")
-        output = self.console.read_until(b"nc-multi> ")
+        output = self.console.read_until(b"shelldeck> ")
         for sid in (1, 2):
             self.assertRegex(output, str(sid).encode() + rb"\s+127\.0\.0\.1:\d+\s+disconnected\s+-")
         self.console.command("ls")
@@ -337,7 +337,7 @@ class BatchIntegrationTests(unittest.TestCase):
             pass
         console.read_until(b"Session 1 idle timeout")
         console.command("jobs 1")
-        output = console.read_until(b"nc-multi> ")
+        output = console.read_until(b"shelldeck> ")
         self.assertRegex(output, rb"1\s+127\.0\.0\.1:\d+\s+idle-timeout\s+-")
         console.connect()
         console.read_until(b"Session 2 connected")
@@ -363,7 +363,7 @@ class BatchIntegrationTests(unittest.TestCase):
     def test_unknown_home_user_does_not_close_listener_or_connections(self):
         client = self.console.connect()
         self.console.read_until(b"Session 1 connected")
-        self.console.command("batch ~__nc_multi_nonexistent_user_123__/script.sh")
+        self.console.command("batch ~__shelldeck_nonexistent_user_123__/script.sh")
         self.console.read_until(b"Batch not started:")
         client.sendall(b"STILL-CONNECTED")
         self.console.command("i 1")

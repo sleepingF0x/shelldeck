@@ -1,0 +1,26 @@
+{
+  "project_root": "~/path/to/shelldeck",
+  "python_binary": "python3",
+  "ssh_host": "YOUR_SSH_HOST",
+  "ssh_binary": "ssh",
+  "remote_allowlist_command": [
+    "python3",
+    "/usr/local/libexec/shelldeck-frp/allowlist.py",
+    "--config",
+    "/etc/shelldeck-frp/access.json"
+  ],
+  "frpc_binary": "~/.local/share/shelldeck/frp/0.71.1/frpc",
+  "frpc_config": "~/.config/shelldeck-frp/frpc.toml",
+  "agent_socket": "~/.config/shelldeck/agent/control.sock",
+  "tmux_binary": "tmux",
+  "tmux_socket": "shelldeck-frp",
+  "tmux_session": "shelldeck",
+  "listen_host": "127.0.0.1",
+  "listen_port": 19000,
+  "launchctl_binary": "launchctl",
+  "launch_agent_label": "com.shelldeck.frp",
+  "launch_agent_path": "~/Library/LaunchAgents/com.shelldeck.frp.plist",
+  "command_path": "~/.local/bin/shelldeck-frp",
+  "log_directory": "~/.local/state/shelldeck-frp",
+  "environment": { "TERM": "xterm-256color" }
+}

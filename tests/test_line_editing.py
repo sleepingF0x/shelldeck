@@ -2,8 +2,8 @@
 
 import unittest
 
-from nc_multi import LINE_LIMIT
-from test_nc_multi import RunningConsole, receive
+from shelldeck import LINE_LIMIT
+from test_shelldeck import RunningConsole, receive
 
 
 class LineEditingIntegrationTests(unittest.TestCase):
@@ -72,7 +72,7 @@ class LineEditingIntegrationTests(unittest.TestCase):
         self.console.connect()
         self.console.read_until(b"Session 2 connected")
         output = self.console.drain()
-        self.assertIn(b"nc-multi> i1\x1b[1D", output)
+        self.assertIn(b"shelldeck> i1\x1b[1D", output)
         self.console.type(b" \r")
         self.console.read_until(b"[Session 1 ")
         self.console.type(b"ready\r")

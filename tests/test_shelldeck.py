@@ -18,12 +18,12 @@ import time
 import unittest
 
 
-SCRIPT = pathlib.Path(__file__).resolve().parents[1] / "nc_multi.py"
+SCRIPT = pathlib.Path(__file__).resolve().parents[1] / "shelldeck.py"
 
 
 class RunningConsole:
     def __init__(self, *arguments, config_home=None):
-        self.config_directory = tempfile.TemporaryDirectory(prefix="nc-multi-test-")
+        self.config_directory = tempfile.TemporaryDirectory(prefix="shelldeck-test-")
         self.config_home = pathlib.Path(config_home or self.config_directory.name)
         self.master, self.slave = pty.openpty()
         self.attributes = termios.tcgetattr(self.slave)
@@ -35,7 +35,7 @@ class RunningConsole:
         )
         self.output = bytearray()
         self.clients = []
-        self.read_until(b"nc-multi> ")
+        self.read_until(b"shelldeck> ")
         self.port = int(re.search(rb"Listening on 127\.0\.0\.1:(\d+)", self.output)[1])
 
     def read_until(self, marker, timeout=5):
@@ -88,7 +88,7 @@ class RunningConsole:
     def detach(self):
         self.drain()
         self.type(b"\x1d")
-        self.read_until(b"nc-multi> ")
+        self.read_until(b"shelldeck> ")
         self.drain()
 
     def stop(self, signum=signal.SIGTERM):
@@ -169,7 +169,7 @@ class SessionIntegrationTests(unittest.TestCase):
         deadline = time.monotonic() + 4
         while True:
             console.command("sessions")
-            output = console.read_until(b"nc-multi> ")
+            output = console.read_until(b"shelldeck> ")
             if re.search(rb"connected\s+1024\s+3076", output):
                 break
             self.assertLess(time.monotonic(), deadline)
@@ -218,7 +218,7 @@ class SessionIntegrationTests(unittest.TestCase):
         third = console.connect()
         console.read_until(b"Session 3 connected")
         console.command("sessions")
-        output = console.read_until(b"nc-multi> ")
+        output = console.read_until(b"shelldeck> ")
         self.assertNotRegex(output, rb"\n1\s+")
         self.assertRegex(output, rb"\n3\s+")
         console.attach(3)

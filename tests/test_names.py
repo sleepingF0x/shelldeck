@@ -8,8 +8,8 @@ import sqlite3
 import tempfile
 import unittest
 
-from nc_multi import IPNames
-from test_nc_multi import RunningConsole, receive
+from shelldeck import IPNames
+from test_shelldeck import RunningConsole, receive
 
 
 def read_names(path):
@@ -22,7 +22,7 @@ class NameDatabaseTests(unittest.TestCase):
     def setUp(self):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
-        self.path = Path(directory.name) / "nc-multi" / "names.db"
+        self.path = Path(directory.name) / "shelldeck" / "names.db"
 
     def test_failed_transaction_preserves_existing_record_and_cache(self):
         names = IPNames(self.path)
@@ -165,7 +165,7 @@ class NameIntegrationTests(unittest.TestCase):
         console.command("name 1 测试机")
         console.read_until("Name saved for 127.0.0.1: 测试机".encode())
         console.command("ls")
-        output = console.read_until(b"nc-multi> ")
+        output = console.read_until(b"shelldeck> ")
         rows = [row for row in output.splitlines() if re.match(rb"[12]\s+127\.0\.0\.1:", row)]
         self.assertEqual(len(rows), 2)
         self.assertTrue(all(row.endswith("测试机".encode()) for row in rows))
@@ -195,7 +195,7 @@ class NameIntegrationTests(unittest.TestCase):
             self.assertIn("(测试 server)".encode(), output)
             second.command("unname 1")
             second.read_until(b"Name removed for 127.0.0.1")
-            self.assertEqual(read_names(Path(directory) / "nc-multi/names.db"), {})
+            self.assertEqual(read_names(Path(directory) / "shelldeck/names.db"), {})
             second.stop()
             third = self.start(config_home=directory)
             third.connect()
@@ -210,13 +210,13 @@ class NameIntegrationTests(unittest.TestCase):
             first.read_until(b"Name saved for 192.0.2.10")
             second.command("name 192.0.2.11 second-host")
             second.read_until(b"Name saved for 192.0.2.11")
-            path = Path(directory) / "nc-multi/names.db"
+            path = Path(directory) / "shelldeck/names.db"
             self.assertEqual(read_names(path),
                              {"192.0.2.10": "first-host", "192.0.2.11": "second-host"})
             second.command("note 192.0.2.10 shared remark")
             second.read_until(b"Note saved for 192.0.2.10")
             first.command("names 192.0.2.10")
-            output = first.read_until(b"nc-multi> ")
+            output = first.read_until(b"shelldeck> ")
             self.assertIn(b"first-host", output)
             self.assertIn(b"shared remark", output)
             second.command("unname 192.0.2.10")
@@ -239,18 +239,18 @@ class NameIntegrationTests(unittest.TestCase):
             first.read_until(b"Closed session 1")
             self.assertEqual(client.recv(1), b"")
             first.command("names 127.0.0.1")
-            output = first.read_until(b"nc-multi> ")
+            output = first.read_until(b"shelldeck> ")
             self.assertIn("测试机".encode(), output)
             self.assertIn("张三维护，用于接口测试".encode(), output)
             first.stop()
             second = self.start(config_home=directory)
             second.command("names")
-            output = second.read_until(b"nc-multi> ")
+            output = second.read_until(b"shelldeck> ")
             self.assertIn("张三维护，用于接口测试".encode(), output)
             second.command("unnote 127.0.0.1")
             second.read_until(b"Note removed for 127.0.0.1")
             second.command("names 127.0.0.1")
-            output = second.read_until(b"nc-multi> ")
+            output = second.read_until(b"shelldeck> ")
             self.assertIn("测试机".encode(), output)
             self.assertIn(b"Note: -", output)
             second.command("unname 127.0.0.1")
@@ -270,10 +270,10 @@ class NameIntegrationTests(unittest.TestCase):
         console.read_until(b"Closed all sessions (1 removed). Listener remains active.")
         self.assertEqual(client.recv(1), b"")
         console.command("names 127.0.0.1")
-        output = console.read_until(b"nc-multi> ")
+        output = console.read_until(b"shelldeck> ")
         self.assertIn("测试机".encode(), output)
         self.assertIn("保留备注".encode(), output)
-        records = IPNames(console.config_home / "nc-multi" / "names.db").records
+        records = IPNames(console.config_home / "shelldeck" / "names.db").records
         self.assertEqual(records["127.0.0.1"], ("测试机", "保留备注"))
         console.connect()
         output = console.read_until(b"Session 2 connected")
@@ -289,7 +289,7 @@ class NameIntegrationTests(unittest.TestCase):
                                 ("name 1 " + "x" * 65, b"Name unchanged:")):
             console.command(command)
             console.read_until(marker)
-        db = sqlite3.connect(console.config_home / "nc-multi/names.db")
+        db = sqlite3.connect(console.config_home / "shelldeck/names.db")
         try:
             db.execute("BEGIN EXCLUSIVE")
             console.command("name 1 cannot-save")
@@ -300,13 +300,13 @@ class NameIntegrationTests(unittest.TestCase):
             db.rollback()
             db.close()
         console.command("ls")
-        output = console.read_until(b"nc-multi> ")
+        output = console.read_until(b"shelldeck> ")
         self.assertNotIn(b"cannot-save", output)
         self.assertIsNone(console.process.poll())
 
     def test_corrupt_file_warns_without_stopping_listener(self):
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "nc-multi/names.json"
+            path = Path(directory) / "shelldeck/names.json"
             path.parent.mkdir()
             path.write_text("{broken")
             console = self.start(config_home=directory)

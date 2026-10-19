@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""A standard-library-only TCP session console for Linux and macOS."""
+"""ShellDeck: a standard-library-only Bash/TCP session console for Linux and macOS."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ import ipaddress
 import json
 import os
 from pathlib import Path
+import re
 import selectors
 import secrets
 import shlex
@@ -27,7 +28,9 @@ import time
 import tty
 import unicodedata
 
-from history_store import HistoryStore, OUTPUT_LIMIT, OUTPUT_PAGE_SIZE, PAGE_SIZE
+from shelldeck_history import HistoryStore, OUTPUT_LIMIT, OUTPUT_PAGE_SIZE, PAGE_SIZE
+from shelldeck_control import AgentError, AgentServer, PROTOCOL_VERSION
+from shelldeck_transfer import FileTransfer, PENDING_STATES as PENDING_TRANSFER_STATES, validate_path
 
 
 READ_SIZE = 65536
@@ -36,8 +39,10 @@ LINE_LIMIT = 8192
 CONTROL_LIMIT = 65536
 DEFAULT_IDLE_TIMEOUT = 900
 JOB_LIMIT = 20
+PROXY_HEADER_LIMIT = 107
+PROXY_HEADER_TIMEOUT = 5
 PENDING_JOB_STATES = {"queued", "sent", "running"}
-PROMPT = b"nc-multi> "
+PROMPT = b"shelldeck> "
 HELP = """Commands:
   sessions / ls          List sessions, including retained disconnected sessions
   interact ID / use ID   Attach with local echo and line editing (plain Bash/TCP)
@@ -69,7 +74,7 @@ Idle timeout counts time without submitted input; remote output does not reset i
 # printf -v preserves trailing newlines; exec starts the script with clean shell variables.
 # Keep the transport command on one line, including this fixed decoder.
 BATCH_DECODER = " ".join(line.strip() for line in r"""
-_ncb_decode() {
+_shelldeck_batch_decode() {
 local LC_ALL=C;
 local payload=$1 alphabet=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/;
 local data padding i block value a b c d octets;
@@ -92,11 +97,11 @@ for ((i=0; i<${#payload}; i+=4)); do
     [[ $octets != *'\000'* ]] || return 1;
     pieces+=("$octets");
 done;
-printf -v _ncb_script '%b' "${pieces[@]}";
+printf -v _shelldeck_batch_script '%b' "${pieces[@]}";
 };
-if _ncb_decode "$1"; then
+if _shelldeck_batch_decode "$1"; then
     [[ ! ${2:-} ]] || printf '\036%s:script\037' "$2";
-    exec bash -c "$_ncb_script" nc-multi-batch;
+    exec bash -c "$_shelldeck_batch_script" shelldeck-batch;
 else printf '[batch] Invalid Base64 script.\n' >&2; exit 125; fi
 """.strip().splitlines())
 
@@ -200,6 +205,54 @@ class BatchResult:
 
 
 @dataclasses.dataclass
+class SessionLease:
+    id: str
+    task: str
+    deadline: float
+
+    def info(self, include_id=False):
+        remaining = max(0, self.deadline - time.monotonic())
+        info = {"task": self.task, "expires_in_seconds": remaining,
+                "expires_at": time.time() + remaining}
+        if include_id:
+            info["lease_id"] = self.id
+        return info
+
+
+def parse_proxy_v1(header: bytes) -> tuple[str, int]:
+    """Read the IPv4 subset of PROXY v1; never fall back to the proxy's IP."""
+    if len(header) > PROXY_HEADER_LIMIT or not header.endswith(b"\r\n"):
+        raise ValueError("invalid PROXY v1 header length or terminator")
+    try:
+        parts = header[:-2].decode("ascii").split(" ")
+        if len(parts) != 6 or parts[:2] != ["PROXY", "TCP4"]:
+            raise ValueError
+        source = str(ipaddress.IPv4Address(parts[2]))
+        ipaddress.IPv4Address(parts[3])
+        for port in parts[4:]:
+            if re.fullmatch(r"0|[1-9][0-9]{0,4}", port) is None or int(port) > 65535:
+                raise ValueError
+    except (UnicodeError, ValueError):
+        raise ValueError("expected a valid PROXY v1 TCP4 header") from None
+    return source, int(parts[4])
+
+
+def validate_proxy_listener(host: str) -> None:
+    try:
+        if ipaddress.IPv4Address(host).is_loopback:
+            return
+    except ValueError:
+        pass
+    raise ValueError("--proxy-protocol requires an IPv4 loopback listener; use -H 127.0.0.1 with local frpc")
+
+
+@dataclasses.dataclass
+class PendingProxy:
+    deadline: float
+    header: bytearray = dataclasses.field(default_factory=bytearray)
+
+
+@dataclasses.dataclass
 class Session:
     id: int
     sock: socket.socket
@@ -212,6 +265,8 @@ class Session:
     outgoing: bytearray = dataclasses.field(default_factory=bytearray)
     batch: BatchResult = None
     connected_at: float = dataclasses.field(default_factory=time.time)
+    lease: SessionLease = None
+    transfer: FileTransfer = None
 
     @property
     def ip(self) -> str:
@@ -340,7 +395,7 @@ class Terminal:
 
     def __enter__(self):
         if not os.isatty(self.input_fd) or not os.isatty(self.output_fd):
-            raise ValueError("run nc-multi in an interactive terminal (stdin and stdout must be TTYs)")
+            raise ValueError("run shelldeck in an interactive terminal (stdin and stdout must be TTYs)")
         self.attributes = termios.tcgetattr(self.input_fd)
         try:
             tty.setraw(self.input_fd, termios.TCSANOW)
@@ -368,8 +423,15 @@ class Terminal:
 
 class Console:
     def __init__(self, listener: socket.socket, terminal: Terminal, buffer_limit: int,
-                 max_sessions: int, idle_timeout: int = DEFAULT_IDLE_TIMEOUT, names=None, history=None):
+                 max_sessions: int, idle_timeout: int = DEFAULT_IDLE_TIMEOUT, names=None, history=None,
+                 agent_socket=None, proxy_protocol=None):
+        if proxy_protocol is not None:
+            if proxy_protocol != "v1":
+                raise ValueError("only PROXY protocol v1 is supported")
+            validate_proxy_listener(listener.getsockname()[0])
         self.listener = listener
+        self.proxy_protocol = proxy_protocol
+        self.pending_proxies = {}
         self.terminal = terminal
         self.buffer_limit = buffer_limit
         self.max_sessions = max_sessions
@@ -377,6 +439,7 @@ class Console:
         self.names = names if names is not None else IPNames()
         self.history = history if history is not None else HistoryStore()
         self.history_updates = {}
+        self.transfer_updates = {}
         self.history_error = ""
         self.history_flush_at = 0
         self.selector = selectors.DefaultSelector()
@@ -395,6 +458,8 @@ class Console:
         self.output_registered = False
         self.running = True
         self.jobs = {}
+        self.agent_socket = agent_socket
+        self.agent_server = None
 
     def emit(self, text: str) -> None:
         self.control.append(text.encode("utf-8"))
@@ -420,6 +485,8 @@ class Console:
         self.selector.register(self.terminal.input_fd, selectors.EVENT_READ, "input")
         host, port = self.listener.getsockname()[:2]
         self.emit(f"Listening on {host}:{port}\nType help for commands. Ctrl+] detaches a session.\n")
+        if self.proxy_protocol:
+            self.emit("PROXY v1 TCP4 required from local frpc; source addresses are supplied by the proxy.\n")
         timeout_label = f"{self.idle_timeout}s without submitted input" if self.idle_timeout else "disabled"
         self.emit(f"Idle timeout: {timeout_label}.\n")
         if self.names.error:
@@ -428,6 +495,9 @@ class Console:
             self.emit(f"[!] History unavailable: {self.history.error}. Batch dispatch requires a writable history database.\n")
         self.prompt()
         try:
+            if self.agent_socket is not None:
+                self.agent_server = AgentServer(self.agent_socket, self.selector, self.agent_request)
+                self.notice(f"Agent socket: {self.agent_server.path}")
             while self.running:
                 self.update_output_interest()
                 for key, mask in self.selector.select(timeout=0.2):
@@ -439,6 +509,8 @@ class Console:
                         self.read_input()
                     elif key.data == "output":
                         self.write_output()
+                    elif callable(key.data):
+                        key.data(key.fileobj, mask)
                     else:
                         session = key.data
                         if session.connected and mask & selectors.EVENT_READ:
@@ -448,8 +520,16 @@ class Console:
                 # Handle ready input first, then expire sessions even when other
                 # connections or the terminal are continuously generating events.
                 self.expire_idle_sessions()
+                self.expire_proxy_headers()
+                self.expire_leases()
                 self.flush_history()
+                if self.agent_server is not None:
+                    self.agent_server.expire()
         finally:
+            if self.agent_server is not None:
+                self.agent_server.close()
+            for sock in list(self.pending_proxies):
+                self.drop_proxy(sock)
             for session in list(self.sessions.values()):
                 self.disconnect(session, notify=False)
             if not self.flush_history(force=True):
@@ -464,21 +544,84 @@ class Console:
                 sock, address = self.listener.accept()
             except BlockingIOError:
                 return
-            if len(self.sessions) >= self.max_sessions:
-                stale = next((sid for sid, s in self.sessions.items()
-                              if not s.connected and sid != self.active), None)
-                if stale is not None:
-                    del self.sessions[stale]
-                else:
-                    sock.close()
-                    self.notice("[!] Session limit reached; new connection rejected.")
-                    continue
             sock.setblocking(False)
-            session = Session(self.next_id, sock, f"{address[0]}:{address[1]}", Buffer(self.buffer_limit))
-            self.next_id += 1
-            self.sessions[session.id] = session
-            self.selector.register(sock, selectors.EVENT_READ, session)
-            self.notice(f"[+] Session {session.id} connected from {session.peer}{self.name_suffix(session)}")
+            if self.proxy_protocol:
+                if not ipaddress.IPv4Address(address[0]).is_loopback:
+                    sock.close()
+                    self.notice("[!] PROXY connection rejected: peer is not loopback.")
+                    continue
+                if len(self.pending_proxies) + sum(s.connected for s in self.sessions.values()) >= self.max_sessions:
+                    sock.close()
+                    self.notice("[!] Session limit reached (including pending PROXY headers); new connection rejected.")
+                    continue
+                self.pending_proxies[sock] = PendingProxy(time.monotonic() + PROXY_HEADER_TIMEOUT)
+                self.selector.register(sock, selectors.EVENT_READ, self.read_proxy_header)
+            else:
+                self.add_session(sock, address)
+
+    def add_session(self, sock, address, initial_data=b"") -> None:
+        # Reclaim old records only after the source address has been validated.
+        if len(self.sessions) >= self.max_sessions:
+            stale = next((sid for sid, s in self.sessions.items()
+                          if not s.connected and sid != self.active), None)
+            if stale is not None:
+                del self.sessions[stale]
+            else:
+                sock.close()
+                self.notice("[!] Session limit reached; new connection rejected.")
+                return
+        session = Session(self.next_id, sock, f"{address[0]}:{address[1]}", Buffer(self.buffer_limit))
+        session.output.append(initial_data)
+        self.next_id += 1
+        self.sessions[session.id] = session
+        self.selector.register(sock, selectors.EVENT_READ, session)
+        self.notice(f"[+] Session {session.id} connected from {session.peer}{self.name_suffix(session)}")
+
+    def drop_proxy(self, sock, reason=None) -> None:
+        if self.pending_proxies.pop(sock, None) is not None:
+            self.selector.unregister(sock)
+            sock.close()
+            if reason:
+                self.notice(f"[!] PROXY connection rejected: {reason}.")
+
+    def expire_proxy_headers(self) -> None:
+        now = time.monotonic()
+        for sock, pending in list(self.pending_proxies.items()):
+            if now >= pending.deadline:
+                self.drop_proxy(sock, "header timeout")
+
+    def read_proxy_header(self, sock, _mask) -> None:
+        pending = self.pending_proxies.get(sock)
+        if pending is None:
+            return
+        # Check here too: a readable socket must not bypass its deadline.
+        if time.monotonic() >= pending.deadline:
+            self.drop_proxy(sock, "header timeout")
+            return
+        try:
+            data = sock.recv(PROXY_HEADER_LIMIT - len(pending.header))
+        except BlockingIOError:
+            return
+        except OSError:
+            self.drop_proxy(sock, "connection lost before header")
+            return
+        if not data:
+            self.drop_proxy(sock, "connection closed before header")
+            return
+        pending.header.extend(data)
+        end = pending.header.find(b"\r\n")
+        if end < 0:
+            if len(pending.header) >= PROXY_HEADER_LIMIT:
+                self.drop_proxy(sock, "header too long")
+            return
+        try:
+            address = parse_proxy_v1(bytes(pending.header[:end + 2]))
+        except ValueError as error:
+            self.drop_proxy(sock, str(error))
+            return
+        del self.pending_proxies[sock]
+        self.selector.unregister(sock)
+        self.add_session(sock, address, bytes(pending.header[end + 2:]))
 
     def read_session(self, session: Session) -> None:
         try:
@@ -489,7 +632,25 @@ class Console:
             self.disconnect(session)
             return
         if data:
-            if session.batch is not None:
+            if session.transfer is not None:
+                transfer = session.transfer
+                try:
+                    data, outgoing = transfer.feed(data)
+                    if outgoing:
+                        if len(session.outgoing) + len(outgoing) > SEND_LIMIT:
+                            raise ValueError("file transfer send queue exceeds the limit")
+                        session.outgoing.extend(outgoing)
+                        session.last_input = time.monotonic()
+                        self.selector.modify(session.sock, selectors.EVENT_READ | selectors.EVENT_WRITE, session)
+                except ValueError as error:
+                    transfer.fail("protocol_error", str(error))
+                    self.disconnect(session, reason="protocol-error")
+                    return
+                self.transfer_updates[transfer.transfer_id] = transfer
+                if transfer.state not in PENDING_TRANSFER_STATES:
+                    session.transfer = None
+                    self.notice(f"[Transfer {transfer.transfer_id}] Session {session.id}: {transfer.state}.")
+            elif session.batch is not None:
                 result = session.batch
                 data = result.feed(data)
                 self.record_history(result)
@@ -508,6 +669,12 @@ class Console:
         session.connected = False
         session.close_reason = reason
         session.outgoing.clear()
+        session.lease = None
+        if session.transfer is not None:
+            transfer = session.transfer
+            transfer.disconnect(reason)
+            self.transfer_updates[transfer.transfer_id] = transfer
+            session.transfer = None
         if session.batch is not None:
             result = session.batch
             if result.state == "running":
@@ -542,6 +709,12 @@ class Console:
         session = self.sessions[self.active]
         if not session.connected:
             return False
+        if self.current_lease(session) is not None:
+            self.emit("\n[Session leased by an agent task; viewing only, input was not queued.]\n")
+            return False
+        if session.transfer is not None:
+            self.emit("\n[File transfer in progress; input was not queued.]\n")
+            return False
         if session.batch is not None:
             self.emit("\n[Batch in progress; input was not queued. Use Ctrl+] then jobs to check progress.]\n")
             return False
@@ -569,6 +742,9 @@ class Console:
             return
         del session.outgoing[:sent]
         if not session.outgoing:
+            if session.transfer is not None and session.transfer.state == "queued":
+                session.transfer.state = "sent"
+                self.transfer_updates[session.transfer.transfer_id] = session.transfer
             if session.batch is not None and session.batch.state == "queued":
                 session.batch.state = "sent"
                 self.record_history(session.batch)
@@ -834,12 +1010,17 @@ class Console:
                 self.emit(f"{session.id:<5} {session.peer:<24} {state:<14} "
                           f"{session.output.size:<10} {session.output.dropped:<10} {str(age) + 's':<9} "
                           f"{idle:<10} {self.names.records.get(session.ip, ('', ''))[0] or '-'}\n")
+                lease = self.current_lease(session)
+                if lease is not None:
+                    self.emit(f"      Agent lease: {lease.task} ({lease.info()['expires_in_seconds']:.0f}s remaining)\n")
             if not self.sessions:
                 self.emit("(no sessions)\n")
         elif name in ("quit", "exit") and len(words) == 1:
             self.running = False
         elif words == ["close", "all"]:
             count = len(self.sessions)
+            for sock in list(self.pending_proxies):
+                self.drop_proxy(sock)
             for session in self.sessions.values():
                 self.disconnect(session, notify=False)
             self.sessions.clear()
@@ -862,6 +1043,8 @@ class Console:
                     self.input_paused = False
                     mode = "raw (no local echo)" if self.raw else "line (local echo)"
                     self.emit(f"[Session {session.id} {session.peer}{self.name_suffix(session)}; {mode}; Ctrl+] detaches]\n")
+                    if self.current_lease(session) is not None:
+                        self.emit("[Agent task owns this session; viewing only until its lease ends.]\n")
                     if session.output.dropped:
                         self.emit(f"[Buffer overflow: {session.output.dropped} oldest bytes dropped in total.]\n")
                     return
@@ -899,44 +1082,58 @@ class Console:
                 if not stat.S_ISREG(os.fstat(file.fileno()).st_mode):
                     raise ValueError("script must be a regular file")
                 source = file.read(SEND_LIMIT + 1)
-            if len(source) > SEND_LIMIT:
-                raise ValueError("script exceeds the 64 KiB send limit")
-            script = source.decode("utf-8-sig").replace("\r\n", "\n")
-            if not script.strip() or "\x00" in script:
-                raise ValueError("script must be nonempty UTF-8 text without NUL bytes")
-            encoded = base64.b64encode(script.encode("utf-8")).decode("ascii")
-            packets = []
-            for session in targets:
-                token = "NCMB_" + secrets.token_hex(16)
-                start = "\\036" + token + ":start\\037"
-                end = "\\036" + token + ":end:%s\\037"
-                # Disable transport tracing before the archived interval, without changing
-                # the interactive shell's options. The script may still enable its own tracing.
-                command = (f"( set +xv; printf {shlex.quote(start)}; if bash -c {shlex.quote(BATCH_DECODER)} "
-                           f"nc-multi-decode {shlex.quote(encoded)} {shlex.quote(token)} </dev/null; "
-                           f"then printf {shlex.quote(end)} 0; else printf {shlex.quote(end)} \"$?\"; fi )\n")
-                packet = command.encode("utf-8")
-                if len(packet) > SEND_LIMIT:
-                    raise ValueError("Base64 script and decoder exceed the 64 KiB send limit; split the script into smaller files")
-                packets.append((session, packet, b"\x1e" + token.encode("ascii") + b":"))
-            stale = None
-            if len(self.jobs) >= JOB_LIMIT:
-                stale = next((jid for jid, (_, results) in self.jobs.items()
-                              if all(r.state not in PENDING_JOB_STATES for r in results)), None)
-                if stale is None:
-                    raise ValueError("too many unfinished jobs; wait for completion or close stalled sessions")
-            if not self.flush_history(force=True):
-                raise ValueError(f"execution history is not writable: {self.history_error}")
-            entries = []
-            for session, packet, marker in packets:
-                result = BatchResult(0, session.id, session.peer, marker)
-                if session.batch is not None or session.outgoing:
-                    result.state = "skipped-busy"
-                entries.append((session, result))
-            job_id = self.history.create_batch(path, hashlib.sha256(script.encode("utf-8")).hexdigest(), entries)
+            script = self.normalize_script(source)
+            job_id, results = self.start_batch(path, script, targets)
         except (OSError, ValueError, sqlite3.Error) as error:
             self.emit(f"[!] Batch not started: {error}\n")
             return
+        self.emit(f"[Job {job_id}] {sum(r.state == 'queued' for r in results)} queued, "
+                  f"{sum(r.state == 'skipped-busy' for r in results)} skipped. Use jobs {job_id} for results.\n")
+
+    @staticmethod
+    def normalize_script(source: bytes) -> str:
+        if len(source) > SEND_LIMIT:
+            raise ValueError("script exceeds the 64 KiB send limit")
+        script = source.decode("utf-8-sig").replace("\r\n", "\n")
+        if not script.strip() or "\x00" in script:
+            raise ValueError("script must be nonempty UTF-8 text without NUL bytes")
+        return script
+
+    def start_batch(self, path: Path, script: str, targets, request_id=None, lease_id=None):
+        """Persist before dispatch; both human and agent commands use this transport."""
+        encoded = base64.b64encode(script.encode("utf-8")).decode("ascii")
+        packets = []
+        for session in targets:
+            token = "SHELLDECK_BATCH_" + secrets.token_hex(16)
+            start = "\\036" + token + ":start\\037"
+            end = "\\036" + token + ":end:%s\\037"
+            # Keep transport tracing outside the archived interval and preserve shell options.
+            command = (f"( set +xv; printf {shlex.quote(start)}; if bash -c {shlex.quote(BATCH_DECODER)} "
+                       f"shelldeck-decode {shlex.quote(encoded)} {shlex.quote(token)} </dev/null; "
+                       f"then printf {shlex.quote(end)} 0; else printf {shlex.quote(end)} \"$?\"; fi )\n")
+            packet = command.encode("utf-8")
+            if len(packet) > SEND_LIMIT:
+                raise ValueError("Base64 script and decoder exceed the 64 KiB send limit; split the script into smaller files")
+            packets.append((session, packet, b"\x1e" + token.encode("ascii") + b":"))
+        stale = None
+        if len(self.jobs) >= JOB_LIMIT:
+            stale = next((jid for jid, (_, results) in self.jobs.items()
+                          if all(r.state not in PENDING_JOB_STATES for r in results)), None)
+            if stale is None:
+                raise ValueError("too many unfinished jobs; wait for completion or close stalled sessions")
+        if not self.flush_history(force=True):
+            raise ValueError(f"execution history is not writable: {self.history_error}")
+        entries = []
+        for session, packet, marker in packets:
+            result = BatchResult(0, session.id, session.peer, marker)
+            lease = self.current_lease(session)
+            if (session.batch is not None or session.transfer is not None or session.outgoing or
+                    (lease is not None and lease.id != lease_id) or
+                    (lease_id is not None and (lease is None or lease.id != lease_id))):
+                result.state = "skipped-busy"
+            entries.append((session, result))
+        job_id = self.history.create_batch(path, hashlib.sha256(script.encode("utf-8")).hexdigest(),
+                                           entries, request_id=request_id, lease_id=lease_id)
         if stale is not None:
             del self.jobs[stale]
         results = [result for _, result in entries]
@@ -948,8 +1145,286 @@ class Console:
             session.last_input = time.monotonic()
             self.selector.modify(session.sock, selectors.EVENT_READ | selectors.EVENT_WRITE, session)
         self.jobs[job_id] = (str(path), results)
-        self.emit(f"[Job {job_id}] {sum(r.state == 'queued' for r in results)} queued, "
-                  f"{sum(r.state == 'skipped-busy' for r in results)} skipped. Use jobs {job_id} for results.\n")
+        return job_id, results
+
+    @staticmethod
+    def agent_id(value, label):
+        if type(value) is not int or not 1 <= value <= 2**63 - 1:
+            raise AgentError("invalid_request", f"{label} must be a positive integer")
+        return value
+
+    @staticmethod
+    def agent_request_id(value):
+        if not isinstance(value, str) or re.fullmatch(r"[A-Za-z0-9_-]{1,128}", value) is None:
+            raise AgentError("invalid_request", "request_id must contain 1-128 ASCII letters, digits, underscores or hyphens")
+        return value
+
+    def current_lease(self, session):
+        lease = session.lease
+        if lease is not None and time.monotonic() >= lease.deadline:
+            session.lease = None
+            self.notice(f"[Lease] Session {session.id}: {lease.task} expired; any pending command still blocks input.")
+        return session.lease
+
+    def expire_leases(self):
+        for session in self.sessions.values():
+            self.current_lease(session)
+
+    @staticmethod
+    def agent_lease_id(value):
+        if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{32}", value) is None:
+            raise AgentError("invalid_request", "lease_id must be a fresh random 32-character lowercase hex string")
+        return value
+
+    def agent_session(self, sid, instance):
+        if instance != self.history.instance:
+            raise AgentError("stale_instance", "console restarted; list sessions again before choosing a target")
+        session = self.sessions.get(sid)
+        if session is None or not session.connected:
+            raise AgentError("session_unavailable", "session does not exist or is disconnected")
+        return session
+
+    def require_lease(self, session, lease_id):
+        lease = self.current_lease(session)
+        if lease is None:
+            raise AgentError("lease_inactive", "lease expired or was released; acquire with a new lease_id")
+        if lease.id != lease_id:
+            raise AgentError("lease_mismatch", "session belongs to a different lease")
+        return lease
+
+    def agent_lease_request(self, method, request, response, sid, instance):
+        response["session_id"] = sid
+        lease_id = self.agent_lease_id(request.get("lease_id"))
+        session = self.agent_session(sid, instance)
+        lease = self.current_lease(session)
+        ttl = request.get("ttl_seconds", 300)
+        if method != "release" and (type(ttl) is not int or not 1 <= ttl <= 3600):
+            raise AgentError("invalid_request", "ttl_seconds must be an integer between 1 and 3600")
+        if method == "acquire":
+            task = request.get("task", "agent task")
+            if (not isinstance(task, str) or not task.strip() or len(task) > 128 or
+                    not task.isprintable()):
+                raise AgentError("invalid_request", "task must be 1-128 printable characters on one line")
+            previous = self.history.get_lease(lease_id)
+            if previous is not None:
+                if (previous["instance"], previous["session_id"], previous["task"], previous["ttl_seconds"]) != (instance, sid, task, ttl):
+                    raise AgentError("lease_conflict", "lease_id was already used with different acquisition parameters")
+                self.require_lease(session, lease_id)
+                response["replayed"] = True
+            else:
+                reason = self.agent_busy_reason(session)
+                if reason:
+                    raise AgentError("session_busy", reason)
+                self.history.create_lease(lease_id, sid, task, ttl)
+                lease = session.lease = SessionLease(lease_id, task, time.monotonic() + ttl)
+                response["replayed"] = False
+                self.notice(f"[Lease] Session {sid} reserved for {task} ({ttl}s).")
+        elif method == "renew":
+            lease = self.require_lease(session, lease_id)
+            lease.deadline = time.monotonic() + ttl
+        else:
+            if lease is None or lease.id != lease_id:
+                previous = self.history.get_lease(lease_id)
+                if previous is None or (previous["instance"], previous["session_id"]) != (instance, sid):
+                    raise AgentError("lease_mismatch", "no matching acquisition for this session")
+                # A lost release response can be retried without touching a new owner.
+                response.update(released=False, lease=None)
+                return response
+            if session.batch is not None or session.transfer is not None or session.outgoing:
+                raise AgentError("session_busy", "execution_pending; release after the command finishes")
+            session.lease = None
+            self.notice(f"[Lease] Session {sid} released by {lease.task}.")
+            response.update(released=True, lease=None)
+            return response
+        response["lease"] = lease.info(include_id=True)
+        return response
+
+    def agent_busy_reason(self, session, lease_id=None):
+        lease = self.current_lease(session)
+        if lease is not None and lease.id != lease_id:
+            return "session_leased"
+        if session.transfer is not None:
+            return "transfer_pending"
+        if session.batch is not None:
+            return "execution_pending"
+        if session.outgoing:
+            return "input_queued"
+        if self.active == session.id and lease is None:
+            return "human_attached"
+        return None
+
+    def agent_result(self, row):
+        if row is None:
+            raise AgentError("not_found", "No such run or request_id")
+        row = dict(row)
+        pending = self.history_updates.get(row["id"])
+        if pending is not None:
+            for field in ("state", "exit_code", "received_at", "started_at", "finished_at"):
+                row[field] = getattr(pending, field)
+            row["output"], row["dropped"] = b"".join(pending.log.parts), pending.log.dropped
+        state = self.history_state(row)
+        completed = state in ("ok", "failed") and row["exit_code"] is not None
+        output = bytes(row["output"])
+        return {"run_id": row["id"], "job_id": row["job_id"], "instance": row["instance"],
+                "session_id": row["session_id"], "peer": row["peer"], "sha256": row["sha256"],
+                "state": state, "last_reported_state": row["state"],
+                "pending": state in PENDING_JOB_STATES, "completed": completed,
+                "success": row["exit_code"] == 0 if completed else None, "exit_code": row["exit_code"],
+                "history_saved": pending is None, "output": output.decode("utf-8", errors="replace"),
+                "output_bytes": len(output), "output_dropped_bytes": row["dropped"],
+                **{key: row[key] for key in ("connected_at", "submitted_at", "received_at", "started_at", "finished_at")}}
+
+    def transfer_result(self, transfer_id, previous=None):
+        pending = self.transfer_updates.get(transfer_id)
+        if pending is not None:
+            info = pending.info()
+        else:
+            previous = previous if previous is not None else self.history.get_transfer(transfer_id)
+            if previous is None:
+                raise AgentError("not_found", "No such transfer_id")
+            info = dict(previous["result"])
+        if info["pending"] and info["instance"] != self.history.instance:
+            info.update(last_reported_state=info["state"], state="unknown", pending=False,
+                        completed=False, success=None,
+                        error={"code": "console_restarted", "message": "Previous console ended before confirmation; do not resubmit with a new ID"})
+        return {**info, "history_saved": pending is None}
+
+    def start_transfer(self, method, request, response, sid, instance):
+        transfer_id = self.agent_request_id(request.get("transfer_id"))
+        lease_id = self.agent_lease_id(request.get("lease_id"))
+        local_path = validate_path(request.get("local_path"), "local_path")
+        remote_path = validate_path(request.get("remote_path"), "remote_path")
+        overwrite = request.get("overwrite", False)
+        if type(overwrite) is not bool:
+            raise AgentError("invalid_request", "overwrite must be a boolean")
+        parameters = {"instance": instance, "session_id": sid, "lease_key": self.history.lease_key(lease_id),
+                      "direction": method, "local_path": local_path, "remote_path": remote_path, "overwrite": overwrite}
+        previous = self.history.get_transfer(transfer_id)
+        response.update(transfer_id=transfer_id, replayed=previous is not None)
+        if previous is not None:
+            if previous["parameters"] != parameters:
+                raise AgentError("transfer_conflict", "transfer_id already belongs to different paths, target, direction, overwrite setting or lease")
+            response["transfer"] = self.transfer_result(transfer_id, previous)
+            return response
+        session = self.agent_session(sid, instance)
+        self.require_lease(session, lease_id)
+        reason = self.agent_busy_reason(session, lease_id)
+        if reason:
+            raise AgentError("session_busy", reason)
+        if not self.flush_history(force=True):
+            raise AgentError("history_unavailable", self.history_error)
+        transfer = FileTransfer(transfer_id, instance, sid, method, local_path, remote_path, overwrite)
+        try:
+            transfer.prepare()
+            packet = transfer.command()
+            if len(packet) > SEND_LIMIT:
+                raise ValueError("file transfer helper exceeds the send limit")
+            self.history.create_transfer(parameters, transfer)
+        except BaseException:
+            transfer.cleanup()
+            raise
+        # Persist the identity before sending any bytes; lost replies never resend.
+        session.transfer = transfer
+        session.outgoing.extend(packet)
+        session.last_input = time.monotonic()
+        self.selector.modify(session.sock, selectors.EVENT_READ | selectors.EVENT_WRITE, session)
+        self.notice(f"[Transfer {transfer_id}] Session {sid}: {method} queued.")
+        response["transfer"] = self.transfer_result(transfer_id)
+        return response
+
+    def agent_request(self, request):
+        """All session selection and dispatch happen on the console's event-loop thread."""
+        try:
+            if not isinstance(request, dict):
+                raise AgentError("invalid_request", "request must be a JSON object")
+            if type(request.get("protocol_version")) is not int or request["protocol_version"] != PROTOCOL_VERSION:
+                raise AgentError("unsupported_version", "protocol_version must be 1")
+            method = request.get("method")
+            ownership = {"instance", "session_id", "lease_id"}
+            fields = {"sessions": set(), "exec": ownership | {"request_id", "script"},
+                      "result": {"run_id", "request_id"}, "acquire": ownership | {"task", "ttl_seconds"},
+                      "renew": ownership | {"ttl_seconds"}, "release": ownership,
+                      "upload": ownership | {"transfer_id", "local_path", "remote_path", "overwrite"},
+                      "download": ownership | {"transfer_id", "local_path", "remote_path", "overwrite"},
+                      "transfer": {"transfer_id"}}
+            if not isinstance(method, str) or method not in fields:
+                raise AgentError("unknown_method", "unknown method; use sessions, acquire, renew, release, exec, result, upload, download or transfer")
+            if set(request) - fields[method] - {"method", "protocol_version"}:
+                raise AgentError("invalid_request", "unexpected request fields")
+            response = {"ok": True, "protocol_version": PROTOCOL_VERSION, "instance": self.history.instance}
+            if method == "sessions":
+                try:
+                    self.names.refresh()
+                except (OSError, ValueError, sqlite3.Error) as error:
+                    response["names_warning"] = str(error)
+                now = time.monotonic()
+                response["idle_timeout_seconds"] = self.idle_timeout
+                response["sessions"] = [
+                    {"id": s.id, "peer": s.peer, "name": self.names.records.get(s.ip, ("", ""))[0],
+                     "note": self.names.records.get(s.ip, ("", ""))[1], "connected": s.connected,
+                     "state": "connected" if s.connected else s.close_reason,
+                     "busy_reason": self.agent_busy_reason(s), "connected_at": s.connected_at,
+                     "lease": s.lease.info() if s.lease is not None else None,
+                     "idle_seconds": max(0, now - s.last_input) if s.connected else None}
+                    for s in self.sessions.values()]
+                return response
+            self.flush_history(force=True)
+            if method == "transfer":
+                transfer_id = self.agent_request_id(request.get("transfer_id"))
+                response.update(transfer_id=transfer_id, transfer=self.transfer_result(transfer_id))
+                return response
+            if method == "result":
+                if ("run_id" in request) == ("request_id" in request):
+                    raise AgentError("invalid_request", "provide exactly one of run_id or request_id")
+                if "run_id" in request:
+                    row = self.history.get(self.agent_id(request["run_id"], "run_id"))
+                else:
+                    row = self.history.get_request(self.agent_request_id(request["request_id"]))
+                response["run"] = self.agent_result(row)
+                return response
+            sid = self.agent_id(request.get("session_id"), "session_id")
+            instance = request.get("instance")
+            if not isinstance(instance, str) or re.fullmatch(r"[0-9a-f]{32}", instance) is None:
+                raise AgentError("invalid_request", "instance must be the value returned by sessions")
+            if method in ("acquire", "renew", "release"):
+                return self.agent_lease_request(method, request, response, sid, instance)
+            if method in ("upload", "download"):
+                return self.start_transfer(method, request, response, sid, instance)
+            request_id = self.agent_request_id(request.get("request_id"))
+            lease_id = self.agent_lease_id(request["lease_id"]) if "lease_id" in request else None
+            if not isinstance(request.get("script"), str):
+                raise AgentError("invalid_request", "script must be a string")
+            script = self.normalize_script(request["script"].encode("utf-8"))
+            previous = self.history.get_request(request_id)
+            response["request_id"] = request_id
+            response["replayed"] = previous is not None
+            if previous is not None:
+                digest = hashlib.sha256(script.encode("utf-8")).hexdigest()
+                if ((previous["instance"], previous["session_id"], previous["sha256"]) != (instance, sid, digest) or
+                        previous["lease_key"] != self.history.lease_key(lease_id)):
+                    raise AgentError("request_conflict", "request_id already belongs to a different command, target or lease")
+                response["run"] = self.agent_result(previous)
+                return response
+            session = self.agent_session(sid, instance)
+            if lease_id is not None:
+                self.require_lease(session, lease_id)
+            reason = self.agent_busy_reason(session, lease_id)
+            if reason:
+                raise AgentError("session_busy", reason)
+            _, results = self.start_batch(Path("agent-" + request_id), script, [session],
+                                          request_id=request_id, lease_id=lease_id)
+            result = results[0]
+            self.notice(f"[Agent {request_id}] Job {result.job_id}, Run {result.record_id}, Session {sid} queued.")
+            response["run"] = self.agent_result(self.history.get(result.record_id))
+            return response
+        except AgentError:
+            raise
+        except sqlite3.Error as error:
+            raise AgentError("history_unavailable", str(error)) from error
+        except OSError as error:
+            raise AgentError("storage_error", str(error)) from error
+        except ValueError as error:
+            raise AgentError("invalid_request", str(error)) from error
 
     def show_jobs(self, words) -> None:
         if len(words) > 2 or (len(words) == 2 and
@@ -974,15 +1449,16 @@ class Console:
             self.history_updates[result.record_id] = result
 
     def flush_history(self, force=False) -> bool:
-        if not self.history_updates:
+        if not self.history_updates and not self.transfer_updates:
             return True
         now = time.monotonic()
-        pending_only = all(result.state in PENDING_JOB_STATES for result in self.history_updates.values())
+        pending_only = (all(result.state in PENDING_JOB_STATES for result in self.history_updates.values()) and
+                        all(t.state in PENDING_TRANSFER_STATES for t in self.transfer_updates.values()))
         if not force and now < self.history_flush_at and (pending_only or self.history_error):
             return not self.history_error
         self.history_flush_at = now + 0.25
         try:
-            self.history.update(list(self.history_updates.values()))
+            self.history.update(list(self.history_updates.values()), list(self.transfer_updates.values()))
         except (OSError, ValueError, sqlite3.Error) as error:
             message = str(error)
             if message != self.history_error:
@@ -990,6 +1466,7 @@ class Console:
             self.history_error = message
             return False
         self.history_updates.clear()
+        self.transfer_updates.clear()
         if self.history_error:
             self.notice("[+] Pending execution history saved.")
         self.history_error = ""
@@ -1167,15 +1644,22 @@ def main() -> int:
     parser.add_argument("-m", "--max-sessions", type=positive, default=100, help="maximum retained sessions; oldest inactive closed record is evicted first")
     parser.add_argument("-t", "--idle-timeout", type=nonnegative, default=DEFAULT_IDLE_TIMEOUT, metavar="SECONDS",
                         help="disconnect each session after this many seconds without submitted input; 0 disables")
+    parser.add_argument("--agent-socket", metavar="PATH", help="enable the local JSON agent interface on a private Unix socket")
+    parser.add_argument("--proxy-protocol", choices=("v1",), help="require PROXY v1 TCP4 from local frpc; requires -H 127.0.0.1")
     args = parser.parse_args()
     if not 0 <= args.port <= 65535:
         parser.error("port must be between 0 and 65535")
+    if args.proxy_protocol:
+        try:
+            validate_proxy_listener(args.host)
+        except ValueError as error:
+            parser.error(str(error))
     handlers = {}
     try:
         config_home = os.environ.get("XDG_CONFIG_HOME")
         config_root = Path(config_home) if config_home and Path(config_home).is_absolute() else Path.home() / ".config"
-        names = IPNames(config_root / "nc-multi" / "names.db")
-        history = HistoryStore(config_root / "nc-multi" / "history.db")
+        names = IPNames(config_root / "shelldeck" / "names.db")
+        history = HistoryStore(config_root / "shelldeck" / "history.db")
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
             listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             listener.bind((args.host, args.port))
@@ -1183,7 +1667,7 @@ def main() -> int:
             listener.setblocking(False)
             with Terminal() as terminal:
                 console = Console(listener, terminal, args.buffer_kib * 1024, args.max_sessions,
-                                  args.idle_timeout, names, history)
+                                  args.idle_timeout, names, history, args.agent_socket, args.proxy_protocol)
 
                 def stop(_signum, _frame):
                     console.running = False
@@ -1192,7 +1676,7 @@ def main() -> int:
                     handlers[signum] = signal.signal(signum, stop)
                 console.run()
     except (OSError, ValueError, termios.error) as error:
-        print(f"nc-multi: {error}", file=sys.stderr)
+        print(f"shelldeck: {error}", file=sys.stderr)
         return 1
     finally:
         for signum, handler in handlers.items():

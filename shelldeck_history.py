@@ -1,6 +1,8 @@
 """Local execution metadata and bounded remote output; no separate script-source field."""
 
 from contextlib import contextmanager, closing
+import hashlib
+import json
 import os
 from pathlib import Path
 import secrets
@@ -60,13 +62,27 @@ class HistoryStore:
             db.execute("CREATE INDEX IF NOT EXISTS runs_job ON script_runs(job_id)")
             db.execute("CREATE INDEX IF NOT EXISTS jobs_script_name ON batch_jobs(script_name)")
             db.execute("CREATE INDEX IF NOT EXISTS jobs_script_path ON batch_jobs(script_path)")
+            db.execute("CREATE TABLE IF NOT EXISTS agent_requests ("
+                       "request_id TEXT PRIMARY KEY, run_id INTEGER NOT NULL UNIQUE, lease_key TEXT)")
+            if "lease_key" not in {row["name"] for row in db.execute("PRAGMA table_info(agent_requests)")}:
+                db.execute("ALTER TABLE agent_requests ADD COLUMN lease_key TEXT")
+            # Remember consumed lease IDs so delayed acquisition retries cannot revive
+            # a released/expired lease. The bearer ID itself is not stored on disk.
+            db.execute("CREATE TABLE IF NOT EXISTS agent_leases ("
+                       "key TEXT PRIMARY KEY, instance TEXT NOT NULL, session_id INTEGER NOT NULL, "
+                       "task TEXT NOT NULL, ttl_seconds INTEGER NOT NULL, created_at REAL NOT NULL)")
+            db.execute("CREATE TABLE IF NOT EXISTS file_transfers ("
+                       "transfer_id TEXT PRIMARY KEY, instance TEXT NOT NULL, "
+                       "parameters TEXT NOT NULL, result TEXT NOT NULL)")
         self.error = ""
 
     def ready(self):
         if self.error:
             self.initialize()
 
-    def create_batch(self, path, digest, entries):
+    def create_batch(self, path, digest, entries, request_id=None, lease_id=None):
+        if request_id is not None and len(entries) != 1:
+            raise ValueError("an agent request must target exactly one session")
         self.ready()
         submitted = time.time()
         ids = []
@@ -83,12 +99,15 @@ class HistoryStore:
                                     (job_id, self.instance, session.id, session.ip, session.peer,
                                      session.connected_at, result.state, finished))
                 ids.append((result, cursor.lastrowid, finished))
+            if request_id is not None:
+                db.execute("INSERT INTO agent_requests (request_id, run_id, lease_key) VALUES (?, ?, ?)",
+                           (request_id, ids[0][1], self.lease_key(lease_id)))
         # Assign IDs only after the entire batch has been committed.
         for result, record_id, finished in ids:
             result.job_id, result.record_id, result.finished_at = job_id, record_id, finished
         return job_id
 
-    def update(self, results):
+    def update(self, results, transfers=()):
         self.ready()
         with self.connection() as db, db:
             db.execute("BEGIN IMMEDIATE")
@@ -100,6 +119,27 @@ class HistoryStore:
                                      result.record_id, self.instance))
                 if cursor.rowcount != 1:
                     raise sqlite3.DatabaseError(f"Execution record {result.record_id} is missing or belongs to another console")
+            for transfer in transfers:
+                cursor = db.execute("UPDATE file_transfers SET result=? WHERE transfer_id=? AND instance=?",
+                                    (json.dumps(transfer.info(), ensure_ascii=True), transfer.transfer_id, self.instance))
+                if cursor.rowcount != 1:
+                    raise sqlite3.DatabaseError(f"Transfer {transfer.transfer_id} is missing or belongs to another console")
+
+    def create_transfer(self, parameters, transfer):
+        self.ready()
+        with self.connection() as db, db:
+            db.execute("INSERT INTO file_transfers VALUES (?, ?, ?, ?)",
+                       (transfer.transfer_id, self.instance, json.dumps(parameters, sort_keys=True),
+                        json.dumps(transfer.info(), ensure_ascii=True)))
+
+    def get_transfer(self, transfer_id):
+        self.ready()
+        with self.connection() as db:
+            row = db.execute("SELECT parameters, result FROM file_transfers WHERE transfer_id=?",
+                             (transfer_id,)).fetchone()
+        if row is None:
+            return None
+        return {"parameters": json.loads(row["parameters"]), "result": json.loads(row["result"])}
 
     def filters(self, session=None, ip=None, script=None):
         clauses, values = [], []
@@ -140,6 +180,32 @@ class HistoryStore:
             return db.execute("SELECT r.*, j.script_path, j.script_name, j.sha256, j.submitted_at "
                               "FROM script_runs r JOIN batch_jobs j ON j.id=r.job_id WHERE r.id=?",
                               (record_id,)).fetchone()
+
+    def get_request(self, request_id):
+        self.ready()
+        with self.connection() as db:
+            row = db.execute("SELECT run_id, lease_key FROM agent_requests WHERE request_id=?", (request_id,)).fetchone()
+        if row is None:
+            return None
+        run = self.get(row["run_id"])
+        return {**dict(run), "lease_key": row["lease_key"]} if run is not None else None
+
+    @staticmethod
+    def lease_key(lease_id):
+        return hashlib.sha256(lease_id.encode("ascii")).hexdigest() if lease_id is not None else None
+
+    def get_lease(self, lease_id):
+        self.ready()
+        with self.connection() as db:
+            return db.execute("SELECT * FROM agent_leases WHERE key=?",
+                              (self.lease_key(lease_id),)).fetchone()
+
+    def create_lease(self, lease_id, session_id, task, ttl_seconds):
+        self.ready()
+        with self.connection() as db, db:
+            db.execute("INSERT INTO agent_leases VALUES (?, ?, ?, ?, ?, ?)",
+                       (self.lease_key(lease_id), self.instance,
+                        session_id, task, ttl_seconds, time.time()))
 
     def close(self):
         if self.memory is not None:

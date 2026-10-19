@@ -8,8 +8,8 @@ import time
 import unittest
 from unittest import mock
 
-from nc_multi import Console
-from test_nc_multi import RunningConsole, SCRIPT, receive
+from shelldeck import Console
+from test_shelldeck import RunningConsole, SCRIPT, receive
 
 
 class IdleDeadlineTests(unittest.TestCase):
@@ -24,7 +24,10 @@ class IdleDeadlineTests(unittest.TestCase):
         self.assertTrue(select.select([self.listener], [], [], 2)[0])
         self.console.accept()
         self.session = self.console.sessions[1]
-        self.origin = self.session.last_input
+        # An exact origin avoids floating-point cancellation at the 900-second
+        # boundary when two separately rounded offsets are subtracted.
+        self.origin = 1000.0
+        self.session.created = self.session.last_input = self.origin
 
     def tearDown(self):
         for session in self.console.sessions.values():
@@ -35,7 +38,7 @@ class IdleDeadlineTests(unittest.TestCase):
         self.listener.close()
 
     def expire_at(self, seconds):
-        with mock.patch("nc_multi.time.monotonic", return_value=self.origin + seconds):
+        with mock.patch("shelldeck.time.monotonic", return_value=self.origin + seconds):
             self.console.expire_idle_sessions()
 
     def remote_output(self, data):
@@ -54,7 +57,7 @@ class IdleDeadlineTests(unittest.TestCase):
         self.assertEqual(self.session.output.head(), b"saved-output")
 
     def test_submitted_input_moves_deadline_but_viewing_does_not(self):
-        with mock.patch("nc_multi.time.monotonic", return_value=self.origin + 800):
+        with mock.patch("shelldeck.time.monotonic", return_value=self.origin + 800):
             self.console.command("interact 1")
             self.console.send(b"echo hello\n")
             self.console.write_session(self.session)
@@ -63,7 +66,7 @@ class IdleDeadlineTests(unittest.TestCase):
         self.expire_at(1699.999)
         self.assertFalse(select.select([self.client], [], [], 0)[0])
         # Merely opening or listing a session must not keep it alive forever.
-        with mock.patch("nc_multi.time.monotonic", return_value=self.origin + 1699.999):
+        with mock.patch("shelldeck.time.monotonic", return_value=self.origin + 1699.999):
             self.console.command("sessions")
             self.console.command("interact 1")
         self.expire_at(1700)
@@ -71,7 +74,7 @@ class IdleDeadlineTests(unittest.TestCase):
         self.assertIsNone(self.console.active)
 
     def test_remote_output_does_not_reset_deadline(self):
-        with mock.patch("nc_multi.time.monotonic", return_value=self.origin + 899):
+        with mock.patch("shelldeck.time.monotonic", return_value=self.origin + 899):
             self.remote_output(b"still-producing-output")
         self.expire_at(900)
         self.assertEqual(self.client.recv(1), b"")
@@ -134,7 +137,7 @@ class IdleIntegrationTests(unittest.TestCase):
         console.type(b"unsent-local-input")
         self.assertEqual(client.recv(1), b"")
         console.read_until(b"Session 1 idle timeout")
-        console.read_until(b"nc-multi> ")
+        console.read_until(b"shelldeck> ")
         console.command("sessions")
         console.read_until(b"idle-timeout")
 

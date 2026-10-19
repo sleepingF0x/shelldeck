@@ -16,12 +16,31 @@ import time
 import unittest
 from types import SimpleNamespace
 
-from history_store import HistoryStore, OUTPUT_LIMIT, PAGE_SIZE
-from nc_multi import BatchResult
-from test_nc_multi import RunningConsole
+from shelldeck_history import HistoryStore, OUTPUT_LIMIT, PAGE_SIZE
+from shelldeck import BatchResult
+from test_shelldeck import RunningConsole
 
 
 class HistoryStoreTests(unittest.TestCase):
+    def test_old_agent_request_table_migrates_without_losing_runs_or_request_ids(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'history.db'
+            store = HistoryStore(path)
+            session = SimpleNamespace(id=1, ip='192.0.2.10', peer='192.0.2.10:1234', connected_at=1000.)
+            result = BatchResult(0, 1, session.peer, b'\x1eTEST:')
+            store.create_batch(Path('legacy.sh'), 'digest', [(session, result)], request_id='legacy-command')
+            with store.connection() as db, db:
+                db.execute('ALTER TABLE agent_requests RENAME TO old_requests')
+                db.execute('CREATE TABLE agent_requests (request_id TEXT PRIMARY KEY, run_id INTEGER NOT NULL UNIQUE)')
+                db.execute('INSERT INTO agent_requests SELECT request_id, run_id FROM old_requests')
+                db.execute('DROP TABLE old_requests')
+            upgraded = HistoryStore(path)
+            self.assertEqual(upgraded.error, '')
+            saved = upgraded.get_request('legacy-command')
+            self.assertEqual(saved['id'], result.record_id)
+            self.assertEqual(saved['sha256'], 'digest')
+            self.assertIsNone(saved['lease_key'])
+
     def test_missing_execution_record_rejects_the_whole_update(self):
         with tempfile.TemporaryDirectory() as directory:
             store = HistoryStore(Path(directory) / 'history.db')
@@ -94,7 +113,7 @@ class HistoryIntegrationTests(unittest.TestCase):
         return console
 
     def db(self):
-        db = sqlite3.connect(self.root / 'nc-multi' / 'history.db')
+        db = sqlite3.connect(self.root / 'shelldeck' / 'history.db')
         db.row_factory = sqlite3.Row
         self.addCleanup(db.close)
         return db
@@ -116,7 +135,7 @@ class HistoryIntegrationTests(unittest.TestCase):
 
     def command(self, text):
         self.console.command(text)
-        return self.console.read_until(b'nc-multi> ')
+        return self.console.read_until(b'shelldeck> ')
 
     def dispatch(self):
         self.console.command('batch ' + shlex.quote(str(self.path)))
@@ -129,7 +148,7 @@ class HistoryIntegrationTests(unittest.TestCase):
             part = client.recv(65536)
             if not part: raise AssertionError('batch was not delivered')
             data.extend(part)
-        return b'\x1e' + re.search(rb'NCMB_[0-9a-f]{32}', data)[0] + b':'
+        return b'\x1e' + re.search(rb'SHELLDECK_BATCH_[0-9a-f]{32}', data)[0] + b':'
 
     def test_two_real_clients_logs_versions_and_late_connection(self):
         self.bash_client('first')
