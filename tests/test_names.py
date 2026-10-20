@@ -153,8 +153,8 @@ class NameDatabaseTests(unittest.TestCase):
 
 
 class NameIntegrationTests(unittest.TestCase):
-    def start(self, **kwargs):
-        console = RunningConsole(**kwargs)
+    def start(self, *args, **kwargs):
+        console = RunningConsole(*args, **kwargs)
         self.addCleanup(console.close)
         return console
 
@@ -205,7 +205,8 @@ class NameIntegrationTests(unittest.TestCase):
     def test_two_listeners_preserve_each_others_saved_changes(self):
         with tempfile.TemporaryDirectory() as directory:
             first = self.start(config_home=directory)
-            second = self.start(config_home=directory)
+            second = self.start("--agent-socket", str(Path(directory) / "second-agent/control.sock"),
+                                config_home=directory)
             first.command("name 192.0.2.10 first-host")
             first.read_until(b"Name saved for 192.0.2.10")
             second.command("name 192.0.2.11 second-host")

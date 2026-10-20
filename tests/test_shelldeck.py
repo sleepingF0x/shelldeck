@@ -1,6 +1,7 @@
 """Black-box tests using real TCP sockets and a real local pseudo-terminal."""
 
 import fcntl
+import json
 import os
 import pathlib
 import pty
@@ -22,15 +23,31 @@ SCRIPT = pathlib.Path(__file__).resolve().parents[1] / "shelldeck.py"
 
 
 class RunningConsole:
-    def __init__(self, *arguments, config_home=None, command=None, environment=None):
+    def __init__(self, *arguments, config_home=None, command=None, environment=None, proxy=False):
         self.config_directory = tempfile.TemporaryDirectory(prefix="shelldeck-test-")
         self.config_home = pathlib.Path(config_home or self.config_directory.name)
+        options = ["--local", "--host", "127.0.0.1", "-p", "0"]
+        if proxy:
+            # Protocol tests use the same remote CLI as an installed command,
+            # with test-owned configuration and a temporary loopback target.
+            root = pathlib.Path(self.config_directory.name)
+            with socket.socket() as probe:
+                probe.bind(("127.0.0.1", 0))
+                port = probe.getsockname()[1]
+            frpc = root / "frpc.json"
+            frpc.write_text(json.dumps({"proxies": [{
+                "name": "test", "type": "tcp", "localIP": "127.0.0.1", "localPort": port,
+                "transport": {"proxyProtocolVersion": "v1"},
+            }]}))
+            config = root / "settings.json"
+            config.write_text(json.dumps({"frpc_config": str(frpc), "proxy_name": "test"}))
+            options = ["--remote", "--config", str(config)]
         self.master, self.slave = pty.openpty()
         self.attributes = termios.tcgetattr(self.slave)
         self.flags = fcntl.fcntl(self.slave, fcntl.F_GETFL)
         self.process = subprocess.Popen(
             list(command) + list(arguments) if command is not None else
-            [sys.executable, str(SCRIPT), "--host", "127.0.0.1", "-p", "0", *arguments],
+            [sys.executable, str(SCRIPT), *options, *arguments],
             stdin=self.slave, stdout=self.slave, stderr=self.slave, close_fds=True,
             env={**os.environ, "XDG_CONFIG_HOME": str(self.config_home), **(environment or {})},
         )

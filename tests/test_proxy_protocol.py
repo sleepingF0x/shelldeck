@@ -2,7 +2,9 @@
 
 import asyncio
 import hashlib
+import json
 import os
+from pathlib import Path
 import select
 import selectors
 import socket
@@ -55,11 +57,19 @@ class ProxyHeaderTests(unittest.TestCase):
 
     def test_cli_rejects_public_listener_before_creating_config(self):
         with tempfile.TemporaryDirectory() as root:
-            result = subprocess.run([sys.executable, str(SCRIPT), "--proxy-protocol", "v1"],
+            frpc = Path(root) / "frpc.json"
+            frpc.write_text(json.dumps({"proxies": [{
+                "name": "test", "type": "tcp", "localIP": "0.0.0.0", "localPort": 9000,
+                "transport": {"proxyProtocolVersion": "v1"},
+            }]}))
+            config = Path(root) / "settings.json"
+            config.write_text(json.dumps({"frpc_config": str(frpc), "proxy_name": "test"}))
+            before = sorted(os.listdir(root))
+            result = subprocess.run([sys.executable, str(SCRIPT), "--remote", "--config", str(config)],
                                     env={**os.environ, "XDG_CONFIG_HOME": root}, capture_output=True)
             self.assertEqual(result.returncode, 2)
             self.assertIn(b"loopback", result.stderr)
-            self.assertEqual(os.listdir(root), [])
+            self.assertEqual(sorted(os.listdir(root)), before)
 
 
 class ProxyAdmissionTests(unittest.TestCase):
@@ -218,7 +228,7 @@ class ProxyAdmissionTests(unittest.TestCase):
 
 class ProxyFixture(AgentFixture):
     def start(self):
-        self.console = RunningConsole("--proxy-protocol", "v1", "--agent-socket", str(self.socket_path),
+        self.console = RunningConsole("--agent-socket", str(self.socket_path), proxy=True,
                                       config_home=self.root)
         self.addCleanup(self.console.close)
         self.instance = self.call("sessions")["instance"]

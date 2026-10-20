@@ -44,7 +44,7 @@ transport.proxyProtocolVersion = "v1"
 }
 ```
 
-`frpc_config` 支持静态 TOML/JSON，所选代理必须是唯一匹配名称的 TCP 代理，显式填写 IPv4 回环 `localIP`、有效整数 `localPort` 和 PROXY v1，且不使用插件。被非空 `start` 排除的代理会被拒绝。ShellDeck 只读取本地连接参数，不修改文件或操作 frp 进程。
+`--remote` 启动时，`frpc_config` 支持静态 TOML/JSON，所选代理必须是唯一匹配名称的 TCP 代理，显式填写 IPv4 回环 `localIP`、有效整数 `localPort` 和 PROXY v1，且不使用插件。被非空 `start` 排除的代理会被拒绝。ShellDeck 读取连接参数，并在能确定时显示 `serverAddr` / `remotePort` 作为客户端入口，不修改配置或操作 frp 进程。
 
 文件路径支持 `~`，相对路径按 ShellDeck JSON 所在目录解析。代理名称、地址、端口和协议须为静态值；其他字段中带引号的环境模板可以保留。任意 Go 模板循环/条件、INI/YAML 不支持。frpc 使用 `includes` 时，可将 `frpc_config` 指向定义该代理的静态片段。
 
@@ -54,16 +54,18 @@ Python 3.11+ 使用标准库读取 TOML；Python 3.9/3.10 先用同一解释器�
 
 ```sh
 python3 scripts/install.py
-shelldeck
+shelldeck --remote
 ```
 
-安装器优先读取 `$XDG_CONFIG_HOME/shelldeck/config.json`；不存在时兼容已有的 `$XDG_CONFIG_HOME/shelldeck-frp/service.json`。未设置有效的绝对 `XDG_CONFIG_HOME` 时使用 `~/.config`。已有配置无需复制，旧配置中的进程管理和 SSH 字段不参与启动。也可用 `--config /absolute/path/to/config.json` 指定文件；显式指定的文件无效时直接报错，不回退其他配置。
+默认在每次启动时优先读取 `$XDG_CONFIG_HOME/shelldeck/config.json`；不存在时兼容已有的 `$XDG_CONFIG_HOME/shelldeck-frp/service.json`。未设置有效的绝对 `XDG_CONFIG_HOME` 时使用 `~/.config`。已有配置无需复制，旧配置中的进程管理和 SSH 字段不参与启动。也可在安装或启动时用 `--config /absolute/path/to/config.json` 指定文件；启动参数优先于安装时绑定的路径。显式指定的文件无效时直接报错，不回退其他配置。
 
-安装器只生成 `~/.local/bin/shelldeck`。确保该目录在 `PATH` 中，缺少时在自己的 shell 配置中加入 `export PATH="$HOME/.local/bin:$PATH"`。已有非本项目生成的同名命令不会被覆盖，可通过 `--command-path` 指定其他位置。移动仓库或更换 Python 后重新安装命令。
+安装器只生成 `~/.local/bin/shelldeck`，绑定 Python 和仓库，不要求 frp 或代理配置已经可用；显式绑定配置时只校验共用设置。确保该目录在 `PATH` 中，缺少时在自己的 shell 配置中加入 `export PATH="$HOME/.local/bin:$PATH"`。已有非本项目生成的同名命令不会被覆盖，可通过 `--command-path` 指定其他位置。移动仓库或更换 Python 后重新安装命令。
 
-ShellDeck 在当前交互终端运行。`ls` 查看会话，`i ID` 进入会话，Ctrl+] 返回菜单，菜单中的 `quit` 退出。退出后 frp 继续运行，再次启动后客户端重新连接。每次启动重新读取代理配置，与其冲突的 `-H` / `-p` 会报错。修改目标时先让 frpc 加载原配置的变更，再重启 ShellDeck。
+ShellDeck 在当前交互终端运行。`ls` 查看会话，`i ID` 进入会话，Ctrl+] 返回菜单，菜单中的 `quit` 退出。退出后 frp 继续运行，再次启动后客户端重新连接。远端模式每次启动重新读取代理配置，`-H` / `-p` 只允许本地模式使用。修改远端模式的本地目标时先让 frpc 加载原配置的变更，再重启 ShellDeck。
 
-原有直连命令 `python3 shelldeck.py -H ... -p ...` 继续可用。已有旧后台 ShellDeck 实例需先停止，以便前台实例使用监听端口和控制 socket。删除仓库中的部署工具不会删除系统中已安装的 frp、启动项或白名单，这些由实际环境继续维护。
+不通过 VPS 时运行 `shelldeck --local -p 9099`，或在仓库运行 `python3 shelldeck.py --local -p 9099`，让客户端连接本机可达 IPv4 的 `9099`。本地模式沿用相同的名称、备注、历史和 agent socket，只读取共用设置，不打开 frpc 配置；没有 ShellDeck 配置时使用默认 socket，已有 JSON 损坏或显式指定的文件缺失时仍报错。
+
+无参数启动现在只显示帮助，两个模式同时指定时报错。旧的脚本启动命令也需要补上 `--local` 或 `--remote`，不能仅用 `--config` 隐式选择远端模式。切换时先退出当前控制台，再启动另一模式；旧会话断开，客户端重新连接，agent 重新获取实例和会话 ID。已有后台实例需先停止，以便前台实例使用监听端口和控制 socket。
 
 若旧 frpc 启动参数或 ShellDeck 的 `frpc_config` 指向仓库内的完整 frpc 示例，升级前先将该配置复制到项目外的 frp 配置目录，保留原鉴权、TLS 文件和运行环境，同步更新这两处路径并确认可用。本次移除了完整 frpc 示例；新的 `proxy.toml` 只是代理片段，不能直接替代完整配置。
 
@@ -75,7 +77,7 @@ ShellDeck 在当前交互终端运行。`ls` 查看会话，`i ID` 进入会话�
 - 来源信息由受信任的本机 frpc 提供；PROXY protocol 本身不认证远端主机，同机其他进程也能连接回环端口。客户端到 VPS 仍是原始 TCP；frp 隧道的 TLS 只覆盖 frpc 与 frps 之间。
 - 每条连接须在接收后 5 秒内发送完整头；头最多 107 字节，等待头的连接与在线会话合计受 `--max-sessions` 限制。等待头不会阻塞已有会话或 Agent 接口，`close all` 和退出会清理这些连接。
 - ShellDeck 退出或隧道真正断开会结束受影响的连接；网络故障的发现时间取决于 TCP/frp 心跳。恢复后客户端重新连接，不恢复旧会话或断点续传；未确认的命令和传输结果保持未知，不自动重发。
-- ShellDeck 的默认 900 秒空闲超时独立生效，frp 心跳不会延长它。长任务可用 `shelldeck -t 0` 或更大的超时。
+- ShellDeck 的默认 900 秒空闲超时独立生效，frp 心跳不会延长它。长任务可用 `shelldeck --remote -t 0` 或更大的超时。
 
 ## 验证
 

@@ -255,6 +255,8 @@ class HistoryIntegrationTests(unittest.TestCase):
         client.sendall(token+b'start\x1f'+token+b'script\x1fIN-PROGRESS')
         self.assertIn(b'running', self.command('history'))
         self.console.stop(signal.SIGKILL)
+        # The owner has exited; remove only this test's known abandoned socket.
+        (self.root / 'shelldeck/agent/control.sock').unlink()
         self.console = self.start()
         new = self.console.connect()
         self.console.read_until(b'Session 1 connected')

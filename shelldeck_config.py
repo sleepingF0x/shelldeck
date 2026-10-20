@@ -1,9 +1,10 @@
-"""Read ShellDeck's local target from an independently managed frpc config."""
+"""Read shared ShellDeck settings and, in remote mode, the existing frpc target."""
 
 import ipaddress
 import json
 import os
 from pathlib import Path
+import re
 
 
 def config_home():
@@ -17,9 +18,16 @@ def default_config():
     return legacy if not current.exists() and legacy.exists() else current
 
 
-def read_config(path):
-    path = Path(path).expanduser().resolve()
-    config = json.loads(path.read_text())
+def read_config(path=None, *, remote=True):
+    explicit = path is not None
+    path = Path(path if explicit else default_config()).expanduser().resolve()
+    try:
+        content = path.read_text()
+    except FileNotFoundError:
+        if explicit or remote:
+            raise
+        content = "{}"
+    config = json.loads(content)
     if not isinstance(config, dict):
         raise ValueError("ShellDeck configuration must be a JSON object")
 
@@ -32,6 +40,11 @@ def read_config(path):
     def local_path(item):
         target = Path(item).expanduser()
         return target if target.is_absolute() else path.parent / target
+
+    agent_socket = local_path(value("agent_socket")) if "agent_socket" in config else config_home() / "shelldeck/agent/control.sock"
+    settings = {"agent_socket": str(agent_socket)}
+    if not remote:
+        return settings
 
     frpc = local_path(value("frpc_config"))
     content = frpc.read_text()
@@ -76,5 +89,14 @@ def read_config(path):
     port = proxy.get("localPort")
     if type(port) is not int or not 1 <= port <= 65535:
         raise ValueError("selected proxy localPort must be an integer from 1 to 65535")
-    agent_socket = local_path(value("agent_socket")) if "agent_socket" in config else config_home() / "shelldeck/agent/control.sock"
-    return {"host": str(address), "port": port, "proxy_protocol": "v1", "agent_socket": str(agent_socket)}
+    remote_port = proxy.get("remotePort")
+    endpoint = "VPS endpoint from the frpc configuration"
+    if type(remote_port) is int and 1 <= remote_port <= 65535:
+        server = proxies.get("serverAddr")
+        # Included proxy fragments and environment templates may not expose a
+        # static server address. Never render arbitrary config text in the TTY.
+        if not isinstance(server, str) or not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9.-]{0,252}", server):
+            server = "<VPS IPv4>"
+        endpoint = f"{server}:{remote_port}"
+    return {**settings, "host": str(address), "port": port, "proxy_protocol": "v1",
+            "client_endpoint": endpoint}

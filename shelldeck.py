@@ -424,13 +424,14 @@ class Terminal:
 class Console:
     def __init__(self, listener: socket.socket, terminal: Terminal, buffer_limit: int,
                  max_sessions: int, idle_timeout: int = DEFAULT_IDLE_TIMEOUT, names=None, history=None,
-                 agent_socket=None, proxy_protocol=None):
+                 agent_socket=None, proxy_protocol=None, client_endpoint=None):
         if proxy_protocol is not None:
             if proxy_protocol != "v1":
                 raise ValueError("only PROXY protocol v1 is supported")
             validate_proxy_listener(listener.getsockname()[0])
         self.listener = listener
         self.proxy_protocol = proxy_protocol
+        self.client_endpoint = client_endpoint
         self.pending_proxies = {}
         self.terminal = terminal
         self.buffer_limit = buffer_limit
@@ -484,9 +485,14 @@ class Console:
         self.selector.register(self.listener, selectors.EVENT_READ, "listener")
         self.selector.register(self.terminal.input_fd, selectors.EVENT_READ, "input")
         host, port = self.listener.getsockname()[:2]
+        self.emit(f"Mode: {'remote (via frp)' if self.proxy_protocol else 'local (direct TCP)'}\n")
         self.emit(f"Listening on {host}:{port}\nType help for commands. Ctrl+] detaches a session.\n")
         if self.proxy_protocol:
+            self.emit(f"Client endpoint: {self.client_endpoint or 'VPS endpoint from the frpc configuration'}\n")
             self.emit("PROXY v1 TCP4 required from local frpc; source addresses are supplied by the proxy.\n")
+        else:
+            address = "<this machine's IPv4>" if host == "0.0.0.0" else host
+            self.emit(f"Client endpoint: {address}:{port}\n")
         timeout_label = f"{self.idle_timeout}s without submitted input" if self.idle_timeout else "disabled"
         self.emit(f"Idle timeout: {timeout_label}.\n")
         if self.names.error:
@@ -1638,34 +1644,42 @@ def nonnegative(value: str) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("--config", type=Path, help="ShellDeck JSON config referencing an existing frpc proxy")
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--remote", action="store_true", help="receive VPS connections through the configured frpc proxy")
+    modes.add_argument("--local", action="store_true", help="receive TCP connections directly on this machine")
+    parser.add_argument("--config", type=Path, help="ShellDeck JSON settings (auto-discovered when omitted)")
     parser.add_argument("-p", "--port", "--listen", type=int, default=argparse.SUPPRESS, metavar="PORT",
-                        help="TCP listening port (9000 without --config); 0 chooses a free port")
-    parser.add_argument("-H", "--host", default=argparse.SUPPRESS, help="IPv4 address (0.0.0.0 without --config)")
+                        help="local mode TCP port (default: 9000); 0 chooses a free port")
+    parser.add_argument("-H", "--host", default=argparse.SUPPRESS, help="local mode IPv4 address (default: 0.0.0.0)")
     parser.add_argument("-b", "--buffer-kib", type=positive, default=1024, help="maximum unread output per session in KiB")
     parser.add_argument("-m", "--max-sessions", type=positive, default=100, help="maximum retained sessions; oldest inactive closed record is evicted first")
     parser.add_argument("-t", "--idle-timeout", type=nonnegative, default=DEFAULT_IDLE_TIMEOUT, metavar="SECONDS",
                         help="disconnect each session after this many seconds without submitted input; 0 disables")
-    parser.add_argument("--agent-socket", metavar="PATH", help="enable the local JSON agent interface on a private Unix socket")
+    parser.add_argument("--agent-socket", metavar="PATH", help="override the shared private JSON agent socket")
     parser.add_argument("--proxy-protocol", choices=("v1",), default=argparse.SUPPRESS,
-                        help="require PROXY v1 TCP4 from local frpc; requires IPv4 loopback")
+                        help="remote mode only; PROXY v1 is already required by the frpc configuration")
     args = parser.parse_args()
-    if args.config is not None:
-        from shelldeck_config import read_config
-        try:
-            configured = read_config(args.config)
-        except (OSError, ValueError) as error:
-            parser.error(str(error))
-        for key in ("host", "port", "proxy_protocol"):
-            if hasattr(args, key) and getattr(args, key) != configured[key]:
-                parser.error(f"{key} conflicts with frpc_config; change the shared proxy configuration")
-            setattr(args, key, configured[key])
-        if args.agent_socket is None:
-            args.agent_socket = configured["agent_socket"]
+    if not (args.remote or args.local):
+        parser.print_help()
+        return 0
+    if args.remote and (hasattr(args, "host") or hasattr(args, "port")):
+        parser.error("--host/--port are only valid with --local; change frpc_config for --remote")
+    if args.local and hasattr(args, "proxy_protocol"):
+        parser.error("--proxy-protocol requires --remote; --local accepts ordinary TCP")
+    from shelldeck_config import read_config
+    try:
+        configured = read_config(args.config, remote=args.remote)
+    except (OSError, ValueError) as error:
+        parser.error(str(error))
+    if args.remote:
+        args.host, args.port = configured["host"], configured["port"]
+        args.proxy_protocol = configured["proxy_protocol"]
     else:
         args.host = getattr(args, "host", "0.0.0.0")
         args.port = getattr(args, "port", 9000)
-        args.proxy_protocol = getattr(args, "proxy_protocol", None)
+        args.proxy_protocol = None
+    if args.agent_socket is None:
+        args.agent_socket = configured["agent_socket"]
     if not 0 <= args.port <= 65535:
         parser.error("port must be between 0 and 65535")
     if args.proxy_protocol:
@@ -1686,7 +1700,8 @@ def main() -> int:
             listener.setblocking(False)
             with Terminal() as terminal:
                 console = Console(listener, terminal, args.buffer_kib * 1024, args.max_sessions,
-                                  args.idle_timeout, names, history, args.agent_socket, args.proxy_protocol)
+                                  args.idle_timeout, names, history, args.agent_socket, args.proxy_protocol,
+                                  configured.get("client_endpoint"))
 
                 def stop(_signum, _frame):
                     console.running = False
