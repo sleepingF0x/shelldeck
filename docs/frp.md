@@ -1,8 +1,8 @@
 # 接入独立部署的 frp
 
-frp 是独立的转发工具，按[官方安装指引](https://gofrp.org/zh-cn/docs/setup/)部署。VPS 运行 frps，本机运行 frpc；它们的版本、配置文件、证书、鉴权、启动项和访问限制由该部署维护。Linux 的常驻管理可参考[官方 systemd 示例](https://gofrp.org/zh-cn/docs/setup/systemd/)，其他平台使用已有的服务管理方式。
+frp 是独立的转发工具，按[官方安装指引](https://gofrp.org/zh-cn/docs/setup/)部署。VPS 运行 frps，本机运行 frpc；它们的版本、配置文件、证书、鉴权、启动项和访问限制由该部署维护。VPS 的 systemd、Mac 的 launchd 配置及管理命令见 [README 独立部署说明](../README.md#frp-deployment)，已有服务直接复用。
 
-ShellDeck 接收 frpc 转发过来的 TCP 连接，并读取 PROXY v1 来源信息。项目只提供这一接入约定和一个代理片段，不提供 frp 安装器、系统服务模板或 VPS 防火墙管理程序。VPS 无需安装 ShellDeck。
+ShellDeck 接收 frpc 转发过来的 TCP 连接，并读取 PROXY v1 来源信息。项目提供接入约定、代理片段和原生服务的文档示例，不提供 frp 安装器、服务管理命令或 VPS 防火墙管理程序。VPS 无需安装 ShellDeck。
 
 ```text
 客户端 Bash ←→ VPS frps :9099 ←→ 本机 frpc ←→ ShellDeck 127.0.0.1:19000

