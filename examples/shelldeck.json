@@ -1,5 +1,5 @@
 {
-  "frpc_config": "~/.config/shelldeck-frp/frpc.toml",
+  "frpc_config": "~/.config/frp/frpc.toml",
   "proxy_name": "shelldeck",
   "agent_socket": "~/.config/shelldeck/agent/control.sock"
 }

@@ -1,6 +1,0 @@
-{
-  "local_source": "192.0.2.10",
-  "callback_sources": ["198.51.100.20/32"],
-  "control_port": 7000,
-  "callback_port": 9099
-}

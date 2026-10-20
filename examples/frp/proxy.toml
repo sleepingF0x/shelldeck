@@ -1,0 +1,9 @@
+# Add this proxy to an existing, independently managed frpc configuration.
+# This fragment is not a complete frpc configuration.
+[[proxies]]
+name = "shelldeck"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 19000
+remotePort = 9099
+transport.proxyProtocolVersion = "v1"

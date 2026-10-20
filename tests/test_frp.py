@@ -1,4 +1,4 @@
-"""Optional real frpc/frps acceptance using the shipped config templates, locally."""
+"""Optional real frp acceptance of the proxy fragment, using temporary local endpoints."""
 
 import os
 import json
@@ -37,18 +37,22 @@ class FrpIntegrationTests(ProxyPayloadChecks, AgentFixture):
             for sock in sockets:
                 sock.close()
         cert, key = self.certificate("server")
-        self.frp_env = {**os.environ, "SHELLDECK_FRP_SERVER_ADDR": "127.0.0.1",
-                        "SHELLDECK_FRP_TOKEN": secrets.token_hex(32),
-                        "SHELLDECK_FRP_CERT_FILE": str(cert), "SHELLDECK_FRP_KEY_FILE": str(key),
-                        "SHELLDECK_FRP_CA_FILE": str(cert)}
-        server = (ROOT / "examples/frp/frps.toml").read_text()
-        server = server.replace('"0.0.0.0"', '"127.0.0.1"')
-        server = server.replace("bindPort = 7000", f"bindPort = {self.control_port}")
-        server = server.replace("single = 9099", f"single = {self.public_port}")
-        client = (ROOT / "examples/frp/frpc.toml").read_text()
-        client = client.replace("serverPort = 7000", f"serverPort = {self.control_port}")
-        client = client.replace("localPort = 19000", f"localPort = {self.console.port}")
-        client = client.replace("remotePort = 9099", f"remotePort = {self.public_port}")
+        self.frp_env = {**os.environ, "FRP_TEST_TOKEN": secrets.token_hex(32),
+                        "FRP_TEST_CA_FILE": str(cert)}
+        # The project ships only a proxy fragment. Test-owned endpoints supply
+        # loopback listeners, random ports and credentials, and temporary TLS.
+        auth = 'auth.method = "token"\nauth.token = "{{ .Envs.FRP_TEST_TOKEN }}"\n'
+        server = (f'bindAddr = "127.0.0.1"\nbindPort = {self.control_port}\n'
+                  f'proxyBindAddr = "127.0.0.1"\nallowPorts = [{{ single = {self.public_port} }}]\n'
+                  + auth + 'transport.tls.force = true\n'
+                  + f'transport.tls.certFile = {json.dumps(str(cert))}\n'
+                  + f'transport.tls.keyFile = {json.dumps(str(key))}\n')
+        proxy = (ROOT / "examples/frp/proxy.toml").read_text()
+        proxy = proxy.replace("localPort = 19000", f"localPort = {self.console.port}")
+        proxy = proxy.replace("remotePort = 9099", f"remotePort = {self.public_port}")
+        client = (f'serverAddr = "127.0.0.1"\nserverPort = {self.control_port}\n'
+                  + auth + 'transport.tls.enable = true\n'
+                  + 'transport.tls.trustedCaFile = "{{ .Envs.FRP_TEST_CA_FILE }}"\n\n' + proxy)
         for name, binary, content in (("frps", FRPS, server), ("frpc", FRPC, client)):
             path = self.root / f"{name}.toml"
             path.write_text(content)
@@ -150,8 +154,8 @@ class FrpIntegrationTests(ProxyPayloadChecks, AgentFixture):
     def test_bad_token_and_untrusted_server_certificate_are_rejected(self):
         self.stop_process(self.frpc)
         other_cert, _ = self.certificate("untrusted")
-        for variable, value in (("SHELLDECK_FRP_TOKEN", secrets.token_hex(32)),
-                                ("SHELLDECK_FRP_CA_FILE", str(other_cert))):
+        for variable, value in (("FRP_TEST_TOKEN", secrets.token_hex(32)),
+                                ("FRP_TEST_CA_FILE", str(other_cert))):
             with self.subTest(variable=variable):
                 rejected = subprocess.run([FRPC, "-c", str(self.root / "frpc.toml")],
                                           env={**self.frp_env, variable: value}, capture_output=True, timeout=10)

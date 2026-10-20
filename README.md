@@ -13,13 +13,13 @@
 | 外部 AI agent | JSON CLI 和 stdio MCP，支持选择会话、执行命令、查询结果 |
 | 多步任务独占 | 申请、续租、释放租约，步骤之间阻止其他任务和人工输入插入 |
 | 文件上传下载 | 二进制和空文件、分块传输、SHA-256 校验、覆盖保护与原子替换 |
-| VPS 代理 | 本机运行 ShellDeck，frp 转发连接并保留来源 IP，按配置维护访问白名单 |
+| VPS 代理 | 接入独立部署的 frp，转发连接并保留来源 IP |
 | 异常恢复 | 相同 ID 重试不重复执行或传输，断线及未确认结果保留为未知 |
 
 常用入口：
 
 - [人工操作](#快速开始)
-- [VPS 代理部署](#frp-deployment)：[配置文件](#frp-config) · [安装、启动与维护](#frp-start) · [完整部署说明](docs/frp-deployment.md)
+- [接入已有 frp](#frp-deployment)：[配置文件](#frp-config) · [启动 ShellDeck](#frp-start) · [接入说明](docs/frp.md)
 - [给 agent 添加 MCP 并使用](#agent-mcp)
 - [CLI 接入](#外部-ai-agent-操作会话)
 - [CentOS 6/7 测试方法](#centos-tests)
@@ -46,23 +46,21 @@ python3 shelldeck.py -p 9000
 
 <a id="frp-deployment"></a>
 
-### frp 常驻，ShellDeck 用时启动
+### 接入已有 frp
 
-VPS 的 **frps** 和本机的 **frpc** 由独立系统服务常驻。ShellDeck 用时在终端输入 `shelldeck`，直接进入控制台；在管理菜单输入 `quit` 即停止。无需 tmux、ShellDeck 后台服务或 `start` / `attach` 管理命令。
+frp 按[官方安装指引](https://gofrp.org/zh-cn/docs/setup/)独立安装和管理：VPS 运行 frps，本机运行 frpc。长期运行方式见[官方 systemd 示例](https://gofrp.org/zh-cn/docs/setup/systemd/)或所用平台的服务管理文档；已有服务直接复用。frp 的启动项、鉴权、TLS 和 VPS 访问白名单属于该部署，不由 ShellDeck 管理。
+
+ShellDeck 只负责本机控制台和会话。用时输入 `shelldeck`，在管理菜单输入 `quit` 退出；frp 继续常驻。
 
 ```text
 客户端 Bash ←→ VPS frps :9099 ←→ 常驻 frpc ←→ 本机 ShellDeck 127.0.0.1:19000
 ```
 
-ShellDeck 退出后，当前会话断开，frp 继续运行；再次启动后客户端重新连接。ShellDeck 未运行时，VPS 端口仍可监听，但无法建立可用的 ShellDeck 会话。AI/CLI/MCP 在 ShellDeck 运行期间使用同一批会话。
-
 <a id="frp-config"></a>
 
-#### 配置一次，复用现有 frpc
+#### 引用现有代理配置
 
-首次部署需单独安装 frp，两端使用相同版本；示例按 0.71.1 验证。已有 frpc 服务直接复用。VPS 白名单、token、TLS 和独立 frp 启动项见[部署说明](docs/frp-deployment.md)。本机与 frpc 应在同一网络命名空间。
-
-现有 frpc 中配置以下代理，公网入口为 `9099`：
+在已有 frpc 配置中加入 [TCP 代理片段](examples/frp/proxy.toml)，由原 frpc 服务加载：
 
 ```toml
 [[proxies]]
@@ -74,55 +72,43 @@ remotePort = 9099
 transport.proxyProtocolVersion = "v1"
 ```
 
-ShellDeck 的小配置只记录现有文件位置、代理名和控制 socket：
+这是代理片段，frp 的服务器地址、凭据和证书继续使用原配置。VPS 的 frps 需允许该代理使用 `9099`，防火墙需允许预期客户端访问此端口。frpc 与 ShellDeck 位于同一机器、同一网络命名空间。
+
+将 [ShellDeck 配置示例](examples/shelldeck.json) 保存为 `~/.config/shelldeck/config.json`，把 `frpc_config` 改成现有 frpc 配置的实际路径：
 
 ```json
 {
-  "frpc_config": "~/.config/shelldeck-frp/frpc.toml",
+  "frpc_config": "~/.config/frp/frpc.toml",
   "proxy_name": "shelldeck",
   "agent_socket": "~/.config/shelldeck/agent/control.sock"
 }
 ```
 
-新部署可将 [shelldeck.json](examples/frp/shelldeck.json) 复制到 `~/.config/shelldeck/config.json`，再修改 `frpc_config`。**已有 `~/.config/shelldeck-frp/service.json` 可直接复用，不必另建一份。** 路径支持 `~`，相对路径按该 JSON 所在目录解析。
-
-本地监听地址、端口和 PROXY v1 从所选 frpc 代理读取；不再维护第二份监听参数，也不复制 frpc 的 token、证书或环境变量。支持静态 TOML/JSON；frpc 使用 `includes` 时，将 ShellDeck 的 `frpc_config` 指向定义该代理的静态片段。所选代理必须是 TCP、IPv4 回环地址、PROXY v1，且不使用插件；任意 Go 模板循环/条件、INI/YAML 不支持。其他字段里的带引号环境模板可原样保留。
+ShellDeck 从所选代理读取本地监听地址、端口和 PROXY v1，不重复配置监听参数，也不复制 frp 凭据。路径支持 `~`，相对路径按该 JSON 所在目录解析。支持静态 TOML/JSON；更多约束和已有配置的兼容方式见[接入说明](docs/frp.md#shelldeck-配置)。
 
 <a id="frp-start"></a>
 
 #### 安装命令与日常使用（Linux / macOS 相同）
 
-推荐使用 Python 3.11+。Python 3.9/3.10 读取 TOML 时，先用同一解释器安装 `requirements-frp.txt`；核心直连模式仍无需第三方库。旧后台部署应先按[迁移说明](docs/frp-deployment.md#从旧后台管理迁移)停止旧 ShellDeck。
-
-在仓库目录安装一次命令：
+推荐 Python 3.11+。Python 3.9/3.10 读取 TOML 时，先用同一解释器运行 `python3 -m pip install -r requirements-frp.txt`。在仓库目录安装一次命令：
 
 ```sh
 python3 scripts/install.py
 ```
 
-安装器优先读取 `$XDG_CONFIG_HOME/shelldeck/config.json`，不存在时复用 `$XDG_CONFIG_HOME/shelldeck-frp/service.json`；未设置有效的绝对 `XDG_CONFIG_HOME` 时使用 `~/.config`。也可显式指定：
+安装器生成 `~/.local/bin/shelldeck`，绑定安装时的 Python、仓库和 ShellDeck 配置。确认 `~/.local/bin` 已加入 `PATH`；移动仓库或更换 Python 后重新安装即可。自定义配置位置时使用 `python3 scripts/install.py --config /absolute/path/to/config.json`。
 
-```sh
-python3 scripts/install.py --config /absolute/path/to/existing.json
-```
-
-安装器只生成 `~/.local/bin/shelldeck`，不会启动程序、创建系统服务、连接 VPS 或修改 frp。它使用安装时的 Python 和仓库路径；移动仓库、更换 Python 后重新安装即可。已有非本项目生成的同名命令不会被覆盖，可以用 `--command-path` 指定另一个路径。确认 `~/.local/bin` 已加入 shell 的 `PATH`。
-
-之后每次只需在交互终端输入：
+之后每次在交互终端运行：
 
 ```sh
 shelldeck
 ```
 
-保持终端运行，让已加入白名单的服务器连接 VPS 的 `9099`。控制台中输入 `ls` 查看会话，`i ID` 进入会话，**Ctrl+]** 返回菜单，菜单中的 `quit` 停止 ShellDeck。关闭终端也会结束本次运行。退出后不会自动重新启动。
+保持终端打开，让已获准访问的客户端连接 VPS 的 **9099**。`ls` 查看会话，`i ID` 进入会话，**Ctrl+]** 返回菜单，菜单中的 `quit` 停止 ShellDeck。关闭终端也会结束运行。退出后会话断开，再次启动后由客户端重新连接；frp 继续运行。
 
-原启动参数仍可使用，例如 `shelldeck -t 1800`。每次启动重新读取共享代理配置；与其冲突的 `-H` / `-p` 会报错，应修改原 frpc 配置并让 frpc 加载变更。公网端口另需与 VPS 的 frps 和白名单保持一致。无须安装命令时也可直接运行：
+原参数仍可使用，例如 `shelldeck -t 1800`。每次启动重新读取共享代理配置；修改监听目标时改原 frpc 配置并让 frpc 加载变更，再重启 ShellDeck。与配置冲突的 `-H` / `-p` 会报错。CLI/MCP 在 ShellDeck 运行期间使用配置中的同一个控制 socket。
 
-```sh
-python3 shelldeck.py --config /absolute/path/to/existing.json
-```
-
-配置读取成功不等于 frpc 在线或 VPS 可达，部署后仍需真实回连确认。白名单维护通过 VPS 上的 [allowlist.py](examples/frp/allowlist.py) 单独进行，见[白名单说明](docs/frp-deployment.md#vps-白名单)。本机出口变化后刷新白名单，新回连来源也需先放行。实际地址、凭据、配置备份和验证产物保存在项目外。
+已有外置配置可继续使用；若仍引用仓库内的完整 frpc 示例，升级前先按[迁移说明](docs/frp.md#shelldeck-配置)将其移到项目外，并更新 frpc 和 ShellDeck 的配置路径。配置读取成功不等于隧道可用，首次接入仍需[验证真实回连](docs/frp.md#验证)。
 
 #### 下载部署脚本的配置
 
@@ -773,7 +759,7 @@ python3 -m unittest discover -s tests -v
 
 测试使用本机回环地址、真实 TCP socket 和伪终端，覆盖多客户端隔离、会话切换、后台输出、缓存溢出、连接上限、慢客户端、终端输出堵塞、Bash 状态保留和退出时的终端恢复。
 
-PROXY v1 测试覆盖来源地址进入名称、备注、历史和 CLI/MCP，头拆包与载荷粘包、二进制往返、畸形/超长/超时头、等待连接上限、断线重连和原直连行为。可选的真实 frpc/frps 测试会验证配置示例、TLS、来源端口和文件传输，入口见 [frp 使用说明](docs/frp.md#验证)。
+PROXY v1 测试覆盖来源地址进入名称、备注、历史和 CLI/MCP，头拆包与载荷粘包、二进制往返、畸形/超长/超时头、等待连接上限、断线重连和原直连行为。可选的真实 frpc/frps 测试在临时目录构造隧道，验证代理片段、TLS、来源端口、文件传输与前台启停，入口见 [frp 接入说明](docs/frp.md#验证)。
 
 行编辑测试覆盖菜单和会话中的光标移动、插入与删除、中文字符宽度、分段到达的按键序列、新连接提示后的光标恢复，以及 raw 模式按键透传。
 
