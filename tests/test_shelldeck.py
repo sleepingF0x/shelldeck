@@ -22,21 +22,26 @@ SCRIPT = pathlib.Path(__file__).resolve().parents[1] / "shelldeck.py"
 
 
 class RunningConsole:
-    def __init__(self, *arguments, config_home=None):
+    def __init__(self, *arguments, config_home=None, command=None, environment=None):
         self.config_directory = tempfile.TemporaryDirectory(prefix="shelldeck-test-")
         self.config_home = pathlib.Path(config_home or self.config_directory.name)
         self.master, self.slave = pty.openpty()
         self.attributes = termios.tcgetattr(self.slave)
         self.flags = fcntl.fcntl(self.slave, fcntl.F_GETFL)
         self.process = subprocess.Popen(
+            list(command) + list(arguments) if command is not None else
             [sys.executable, str(SCRIPT), "--host", "127.0.0.1", "-p", "0", *arguments],
             stdin=self.slave, stdout=self.slave, stderr=self.slave, close_fds=True,
-            env={**os.environ, "XDG_CONFIG_HOME": str(self.config_home)},
+            env={**os.environ, "XDG_CONFIG_HOME": str(self.config_home), **(environment or {})},
         )
         self.output = bytearray()
         self.clients = []
-        self.read_until(b"shelldeck> ")
-        self.port = int(re.search(rb"Listening on 127\.0\.0\.1:(\d+)", self.output)[1])
+        try:
+            self.read_until(b"shelldeck> ")
+            self.port = int(re.search(rb"Listening on 127\.0\.0\.1:(\d+)", self.output)[1])
+        except BaseException:
+            self.close()
+            raise
 
     def read_until(self, marker, timeout=5):
         deadline = time.monotonic() + timeout

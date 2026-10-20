@@ -1638,15 +1638,34 @@ def nonnegative(value: str) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("-p", "--port", "--listen", type=int, default=9000, metavar="PORT", help="TCP listening port; 0 chooses a free port")
-    parser.add_argument("-H", "--host", default="0.0.0.0", help="IPv4 address to listen on")
+    parser.add_argument("--config", type=Path, help="ShellDeck JSON config referencing an existing frpc proxy")
+    parser.add_argument("-p", "--port", "--listen", type=int, default=argparse.SUPPRESS, metavar="PORT",
+                        help="TCP listening port (9000 without --config); 0 chooses a free port")
+    parser.add_argument("-H", "--host", default=argparse.SUPPRESS, help="IPv4 address (0.0.0.0 without --config)")
     parser.add_argument("-b", "--buffer-kib", type=positive, default=1024, help="maximum unread output per session in KiB")
     parser.add_argument("-m", "--max-sessions", type=positive, default=100, help="maximum retained sessions; oldest inactive closed record is evicted first")
     parser.add_argument("-t", "--idle-timeout", type=nonnegative, default=DEFAULT_IDLE_TIMEOUT, metavar="SECONDS",
                         help="disconnect each session after this many seconds without submitted input; 0 disables")
     parser.add_argument("--agent-socket", metavar="PATH", help="enable the local JSON agent interface on a private Unix socket")
-    parser.add_argument("--proxy-protocol", choices=("v1",), help="require PROXY v1 TCP4 from local frpc; requires -H 127.0.0.1")
+    parser.add_argument("--proxy-protocol", choices=("v1",), default=argparse.SUPPRESS,
+                        help="require PROXY v1 TCP4 from local frpc; requires IPv4 loopback")
     args = parser.parse_args()
+    if args.config is not None:
+        from shelldeck_config import read_config
+        try:
+            configured = read_config(args.config)
+        except (OSError, ValueError) as error:
+            parser.error(str(error))
+        for key in ("host", "port", "proxy_protocol"):
+            if hasattr(args, key) and getattr(args, key) != configured[key]:
+                parser.error(f"{key} conflicts with frpc_config; change the shared proxy configuration")
+            setattr(args, key, configured[key])
+        if args.agent_socket is None:
+            args.agent_socket = configured["agent_socket"]
+    else:
+        args.host = getattr(args, "host", "0.0.0.0")
+        args.port = getattr(args, "port", 9000)
+        args.proxy_protocol = getattr(args, "proxy_protocol", None)
     if not 0 <= args.port <= 65535:
         parser.error("port must be between 0 and 65535")
     if args.proxy_protocol:

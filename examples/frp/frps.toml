@@ -2,7 +2,7 @@
 bindAddr = "0.0.0.0"
 bindPort = 7000
 proxyBindAddr = "0.0.0.0"
-allowPorts = [{ single = 9000 }]
+allowPorts = [{ single = 9099 }]
 
 auth.method = "token"
 auth.token = "{{ .Envs.SHELLDECK_FRP_TOKEN }}"

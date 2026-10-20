@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Optional macOS LaunchAgent for a NEW standalone frpc installation.
+     Reuse an existing service instead of creating a second frpc process.
+     Fill absolute paths and create the private log directory first. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.shelldeck.frpc</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/absolute/path/to/frpc</string>
+    <string>-c</string>
+    <string>/absolute/path/to/frpc.toml</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>5</integer>
+  <key>Umask</key><integer>63</integer>
+  <key>StandardOutPath</key><string>/absolute/path/to/logs/frpc.log</string>
+  <key>StandardErrorPath</key><string>/absolute/path/to/logs/frpc.error.log</string>
+</dict>
+</plist>

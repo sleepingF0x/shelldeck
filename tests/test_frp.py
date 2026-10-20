@@ -1,11 +1,13 @@
 """Optional real frpc/frps acceptance using the shipped config templates, locally."""
 
 import os
+import json
 import secrets
 import select
 import shutil
 import socket
 import subprocess
+import sys
 import time
 import unittest
 
@@ -42,11 +44,11 @@ class FrpIntegrationTests(ProxyPayloadChecks, AgentFixture):
         server = (ROOT / "examples/frp/frps.toml").read_text()
         server = server.replace('"0.0.0.0"', '"127.0.0.1"')
         server = server.replace("bindPort = 7000", f"bindPort = {self.control_port}")
-        server = server.replace("single = 9000", f"single = {self.public_port}")
+        server = server.replace("single = 9099", f"single = {self.public_port}")
         client = (ROOT / "examples/frp/frpc.toml").read_text()
         client = client.replace("serverPort = 7000", f"serverPort = {self.control_port}")
         client = client.replace("localPort = 19000", f"localPort = {self.console.port}")
-        client = client.replace("remotePort = 9000", f"remotePort = {self.public_port}")
+        client = client.replace("remotePort = 9099", f"remotePort = {self.public_port}")
         for name, binary, content in (("frps", FRPS, server), ("frpc", FRPC, client)):
             path = self.root / f"{name}.toml"
             path.write_text(content)
@@ -155,6 +157,43 @@ class FrpIntegrationTests(ProxyPayloadChecks, AgentFixture):
                                           env={**self.frp_env, variable: value}, capture_output=True, timeout=10)
                 self.assertNotEqual(rejected.returncode, 0, "invalid frp credentials were accepted")
         self.assertEqual(self.call("sessions")["sessions"], [])
+
+    def test_independent_frpc_survives_foreground_quit_and_relaunch(self):
+        self.console.stop()
+        config = self.root / "config.json"
+        config.write_text(json.dumps({"frpc_config": str(self.root / "frpc.toml"), "proxy_name": "shelldeck",
+                                      "agent_socket": str(self.socket_path)}))
+        command = self.root / "bin/shelldeck"
+        installed = subprocess.run([sys.executable, str(ROOT / "scripts/install.py"), "--config", str(config),
+                                    "--command-path", str(command)], capture_output=True, text=True, timeout=10)
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        original_config = (self.root / "frpc.toml").read_bytes()
+        original_frpc_pid = self.frpc.pid
+        instances = []
+        for attempt in range(2):
+            self.console = RunningConsole(command=[str(command)], config_home=self.root,
+                                          environment={"PATH": "/nonexistent"})
+            self.addCleanup(self.console.close)
+            self.instance = self.call("sessions")["instance"]
+            instances.append(self.instance)
+            peer = self.peer()
+            submitted = self.execute(request_id=f"foreground-{attempt}")
+            self.assertTrue(submitted["ok"], submitted)
+            token = self.token(peer)
+            peer.sendall(token + b"start\x1f" + token + b"script\x1fforeground" + token + b"end:0\x1f")
+            self.assertEqual(self.result(submitted["run"]["run_id"])["output"], "foreground")
+            if attempt == 0:
+                self.console.command("quit")
+                self.assertEqual(self.console.process.wait(timeout=5), 0)
+            else:
+                self.console.stop()
+                self.assertEqual(self.console.process.returncode, 0)
+            self.assertEqual(peer.recv(1), b"")
+            self.assertFalse(self.socket_path.exists())
+            self.assertIsNone(self.frpc.poll(), "exiting ShellDeck stopped the shared frpc")
+            self.assertEqual(self.frpc.pid, original_frpc_pid)
+            self.assertEqual((self.root / "frpc.toml").read_bytes(), original_config)
+        self.assertNotEqual(instances[0], instances[1])
 
 
 if __name__ == "__main__":

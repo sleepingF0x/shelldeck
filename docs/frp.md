@@ -3,24 +3,24 @@
 本机运行 ShellDeck、frpc、CLI 和 MCP，VPS 只运行 frps。客户端连接 VPS 的 TCP 端口，frpc 将每个连接独立转发到本机，并在连接开头附带 VPS 看到的客户端来源 IPv4 地址和端口。
 
 ```text
-客户端 Bash ←→ VPS frps :9000 ←→ 本机 frpc ←→ ShellDeck 127.0.0.1:19000
+客户端 Bash ←→ VPS frps :9099 ←→ 本机 frpc ←→ ShellDeck 127.0.0.1:19000
                               ↑
                   本机 frpc 主动连接 VPS :7000（TLS）
 ```
 
 | 位置 | 程序或文件 | 用途 |
 | --- | --- | --- |
-| VPS | frps、[frps.toml](../examples/frp/frps.toml) | 7000 接收 frpc 隧道，9000 接收客户端 |
+| VPS | frps、[frps.toml](../examples/frp/frps.toml) | 7000 接收 frpc 隧道，9099 接收客户端 |
 | 本机 | frpc、[frpc.toml](../examples/frp/frpc.toml) | 连接 VPS，并将会话转发到本机 19000 |
 | 本机 | ShellDeck | 解析来源地址、管理会话、保存名称和历史 |
 
-两个 frp 程序使用同一版本。本示例使用 TOML，对应 frp 0.71.1。ShellDeck 本身不增加 Python 依赖。VPS 无需部署 ShellDeck，也不保存它的名称库、命令历史或传输文件。
+两个 frp 程序使用同一版本。本示例使用 TOML，对应 frp 0.71.1。ShellDeck 核心直连模式无需第三方库；共享 TOML 配置在 Python 3.9/3.10 下需要 `requirements-frp.txt`。VPS 无需部署 ShellDeck，也不保存它的名称库、命令历史或传输文件。
 
 ## 0. 安装 frp
 
 先从 [frp 官方发布页](https://github.com/fatedier/frp/releases) 下载匹配操作系统和 CPU 架构的压缩包。解压后，VPS 使用其中的 `frps`，本机使用对应平台包中的 `frpc`；将程序放到各自配置指定的路径。下文直接使用 `frps`、`frpc` 命令，要求所在目录已加入 `PATH`，也可替换为实际程序路径。
 
-ShellDeck 不附带或自动安装这两个程序，本机管理脚本的 `install` 也只生成本机启动配置。准备好下文的鉴权、证书和端口白名单后，先启动 VPS 上的 frps，再启动本机 ShellDeck 和 frpc。使用白名单脚本及系统服务管理时，按 [部署说明](frp-deployment.md#安装前提与顺序) 操作。
+ShellDeck 不附带或自动安装这两个程序，`scripts/install.py` 只生成前台启动命令。准备好下文的鉴权、证书和端口白名单后，先启动 VPS 上的 frps，再启动本机 ShellDeck 和 frpc。使用白名单脚本及系统服务管理时，按 [部署说明](frp-deployment.md#安装前提与顺序) 操作。
 
 ## 1. 准备鉴权和 TLS
 
@@ -59,9 +59,11 @@ frps verify -c ./frps.toml
 frps -c ./frps.toml
 ```
 
-示例只允许 frpc 申请 9000 端口，要求隧道使用 TLS，并通过 token 验证 frpc。VPS 的防火墙或安全组需要允许本机访问 TCP 7000、允许预期客户端访问 TCP 9000。7000 是 frp 控制入口，客户端 Bash 连接的是 9000。
+示例只允许 frpc 申请 9099 端口，要求隧道使用 TLS，并通过 token 验证 frpc。VPS 的防火墙或安全组需要允许本机访问 TCP 7000、允许预期客户端访问 TCP 9099。7000 是 frp 控制入口，客户端 Bash 连接的是 9099。
 
 ## 3. 在本机启动 ShellDeck 和 frpc
+
+下面是首次排查时的手工启动方式。日常让 frpc 由独立系统服务常驻，按 [README](../README.md#frp-start) 安装一次 `shelldeck` 命令，用时直接运行。已有常驻 frpc 时跳过下面的 frpc 启动命令。共享配置方式自动读取现有代理的本地目标和协议，无需再次填写监听参数。
 
 先在项目目录的交互终端启动 ShellDeck：
 
@@ -85,7 +87,7 @@ frpc verify -c examples/frp/frpc.toml
 frpc -c examples/frp/frpc.toml
 ```
 
-等 frpc 报告代理启动成功，再让客户端连接 VPS 的 IPv4 地址和 9000 端口。客户端仍使用原有 Bash/TCP 连接方式，只需将服务端地址换成 VPS；客户端不需要 frp、Python 或 PROXY protocol 支持。
+等 frpc 报告代理启动成功，再让客户端连接 VPS 的 IPv4 地址和 9099 端口。客户端仍使用原有 Bash/TCP 连接方式，只需将服务端地址换成 VPS；客户端不需要 frp、Python 或 PROXY protocol 支持。
 
 配置中的 `transport.proxyProtocolVersion = "v1"` 必须与 ShellDeck 的 `--proxy-protocol v1` 一起启用。修改端口时，VPS 的 `allowPorts`、frpc 的 `remotePort` 和客户端连接端口需一致；frpc 的 `localPort` 与 ShellDeck 的 `-p` 需一致。
 

@@ -1,0 +1,15 @@
+# Optional Linux user service for a NEW standalone frpc installation.
+# Reuse an existing frpc service instead of installing a second one.
+# Fill absolute paths; keep token/TLS configuration in the private frpc TOML.
+[Unit]
+Description=Standalone frpc
+
+[Service]
+Type=simple
+ExecStart=/absolute/path/to/frpc -c /absolute/path/to/frpc.toml
+Restart=always
+RestartSec=5
+UMask=0077
+
+[Install]
+WantedBy=default.target
