@@ -22,7 +22,7 @@ remotePort = 9099
 transport.proxyProtocolVersion = "v1"
 ```
 
-保留原 frpc 的服务器地址、控制端口、鉴权和 TLS 设置。该片段不是完整的 frpc 配置；VPS 的 frps 需要允许代理使用 `9099`，访问白名单由 VPS 的防火墙或安全组维护。本机主动连接 VPS，通常不需要 DDNS；本机出口变化后由原部署方式更新访问限制。
+保留原 frpc 的服务器地址、控制端口、鉴权和 TLS 设置。该片段不是完整的 frpc 配置；VPS 的 frps 需要允许代理使用 `9099`。按 [README 公网访问策略](../README.md#frp-public-access)，VPS 防火墙和云安全组对任意 IPv4 放行 `7000/TCP`、`9099/TCP`，并由原防火墙管理工具持久化规则。本机主动连接 VPS，出口 IP 变化无需更新白名单，也不需要为本机配置 DDNS。
 
 三个关键字段：
 
@@ -74,7 +74,7 @@ ShellDeck 在当前交互终端运行。`ls` 查看会话，`i ID` 进入会话�
 - 名称、备注、CLI/MCP 和执行历史使用 **VPS 看到的客户端出口 IPv4 地址**。同一 NAT 后的多台机器可能共用 IP 和名称，但会话 ID 各自独立。
 - 当前只接受 PROXY v1 的 `TCP4`。`TCP6`、`UNKNOWN`、v2、畸形或缺失的头不会创建会话。客户端应连接 VPS 的 IPv4 地址。
 - frpc 与 ShellDeck 须在同机、同一网络命名空间。ShellDeck 监听 IPv4 回环地址，只接受回环连接；容器部署需要另行安排网络，不能直接把这个监听器暴露到公网。
-- 来源信息由受信任的本机 frpc 提供；PROXY protocol 本身不认证远端主机，同机其他进程也能连接回环端口。客户端到 VPS 仍是原始 TCP；frp 隧道的 TLS 只覆盖 frpc 与 frps 之间。
+- 来源信息由受信任的本机 frpc 提供；PROXY protocol 本身不认证远端主机，同机其他进程也能连接回环端口。`7000` 通过 token 认证 frpc，frps 强制 TLS，frpc 使用受信任 CA 单向校验 frps 证书。连接 `9099` 的 Bash 客户端无需 frp token，客户端到 VPS 仍是原始 TCP；frp 隧道的 TLS 只覆盖 frpc 与 frps 之间。
 - 每条连接须在接收后 5 秒内发送完整头；头最多 107 字节，等待头的连接与在线会话合计受 `--max-sessions` 限制。等待头不会阻塞已有会话或 Agent 接口，`close all` 和退出会清理这些连接。
 - ShellDeck 退出或隧道真正断开会结束受影响的连接；网络故障的发现时间取决于 TCP/frp 心跳。恢复后客户端重新连接，不恢复旧会话或断点续传；未确认的命令和传输结果保持未知，不自动重发。
 - ShellDeck 的默认 900 秒空闲超时独立生效，frp 心跳不会延长它。长任务可用 `shelldeck --remote -t 0` 或更大的超时。
@@ -98,6 +98,6 @@ SHELLDECK_FRPS=/absolute/path/to/frps \
 
 真实链路测试覆盖来源 IP/端口、会话隔离、TLS 与 token 拒绝、二进制文件往返、隧道断开，以及 ShellDeck 前台退出后 frpc 继续运行、重新启动后再次接入。
 
-首次接入已有 VPS 后，还需从允许的来源真实回连：核对来源 IP，执行一个无害命令，上传下载临时文件并核对 SHA-256，再退出和重新启动 ShellDeck 后验证新连接。只看到端口开放或 frpc 登录成功不能替代这组验收。访问白名单由 frp 的部署环境另外验证。
+首次接入已有 VPS 后，还需从另一台公网 IPv4 主机验证 `7000` 可连接，并经 `9099` 真实回连：核对来源 IP，执行一个无害命令，上传下载临时文件并核对 SHA-256，再退出和重新启动 ShellDeck 后验证新连接。只看到端口开放或 frpc 登录成功不能替代这组验收。另用无代理定义的临时 frpc 配置验证正常登录、错误或缺失 token 被拒绝，以及不受信任的服务端证书被拒绝；核对具体错误，不能把网络超时当作认证失败。防火墙及安全组放行、规则持久化由 frp 的部署环境另外验证。
 
 参考：[frp 代理参数](https://gofrp.org/zh-cn/docs/reference/proxy/)、[TLS 证书验证](https://gofrp.org/zh-cn/docs/features/common/network/network-tls/)、[配置校验](https://gofrp.org/zh-cn/docs/features/common/configure/)。

